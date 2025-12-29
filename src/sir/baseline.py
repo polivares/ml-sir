@@ -1,6 +1,9 @@
 """Classical baseline fitting for SIR parameters.
 
-Implements MSE and Poisson/NegBin MLE with multi-start optimization."""
+Implements MSE fitting to I(t) and MLE for Poisson/NegBin observation models.
+Includes multi-start optimization for robustness and returns timing info.
+Used by Exp0/Exp1/Exp2 as the classical comparison baseline.
+"""
 
 
 from dataclasses import dataclass

@@ -1,6 +1,8 @@
 """Metrics for SIR parameter estimation.
 
-Includes MAE/RMSE/R2 per parameter and timing summaries."""
+Provides MAE/RMSE/R2 per parameter and timing summaries (p50/p90).
+These helpers standardize reporting across classical and ML benchmarks.
+"""
 
 
 from typing import Dict

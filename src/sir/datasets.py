@@ -1,6 +1,10 @@
 """Dataset helpers for SIR benchmarks.
 
-Loads sir.pkl, builds X/y arrays, and creates reproducible splits."""
+Loads sir.pkl (list of (outputs, times, params)), builds X=I(t) and y=(beta,gamma),
+provides reproducible train/val/test splits, and offers simple normalization
+utilities. Used by benchmark scripts and notebooks to keep data handling
+consistent.
+"""
 
 
 from pathlib import Path

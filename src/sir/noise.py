@@ -1,6 +1,9 @@
 """Observation models and preprocessing utilities.
 
-Applies Poisson/NegBin noise plus windowing, downsampling, and missingness."""
+Implements Poisson and Negative Binomial observation models plus utilities
+for windowing, downsampling, and missingness with simple imputation.
+Used to build more realistic observation pipelines in Exp1/Exp2 and beyond.
+"""
 
 
 from typing import Optional, Tuple, Union

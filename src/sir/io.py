@@ -1,6 +1,8 @@
 """Run I/O helpers.
 
-Saves configs and metric tables for experiments."""
+Small utilities to create output folders and persist configs/metrics as
+JSON and CSV. Used by scripts to standardize run artifacts in runs/.
+"""
 
 
 from pathlib import Path

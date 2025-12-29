@@ -1,6 +1,8 @@
 """Utilities for SIR benchmarking.
 
-Re-exports common helpers so notebooks/scripts can import from src.sir."""
+Provides a small namespace that re-exports common helpers so notebooks and
+scripts can import from src.sir without deep module paths.
+"""
 
 
 # Re-export core helpers for convenience (avoid heavy imports here).

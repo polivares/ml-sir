@@ -1,6 +1,9 @@
 """Cache helpers for derived datasets and splits.
 
-Stores arrays and config hashes to reuse preprocessing."""
+Stores derived arrays and split indices under a short hash key computed from
+the preprocessing config. Scripts use this to avoid recomputing large arrays
+when rerunning benchmarks with the same settings.
+"""
 
 
 from __future__ import annotations

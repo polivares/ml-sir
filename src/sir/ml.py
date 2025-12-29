@@ -1,6 +1,9 @@
 """ML/DL models for SIR parameter inference.
 
-Defines MLP/CNN architectures and training helpers."""
+Defines Keras MLP and CNN1D architectures plus training and inference timing
+helpers. These models map I(t) to (beta, gamma) and are used by benchmark
+scripts for ML baselines. Requires TensorFlow to be installed.
+"""
 
 
 from dataclasses import dataclass

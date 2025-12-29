@@ -1,6 +1,10 @@
 """SIR simulation wrapper using summer.
 
-Provides a single entry point to generate I(t) or full SIR trajectories."""
+Provides a single entry point to simulate SIR trajectories given (beta, gamma)
+and initial conditions. By default it returns I(t); optionally returns full
+S, I, R outputs and the time grid for downstream baselines and plotting.
+Used by classical fitting routines that need to re-simulate curves.
+"""
 
 
 from typing import Tuple, Union

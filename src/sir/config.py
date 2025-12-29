@@ -1,6 +1,9 @@
 """Central defaults for SIR benchmarks.
 
-Holds shared configuration and a global seed setter."""
+Defines the Defaults dataclass with shared experiment settings (ranges,
+time grid, split sizes, data paths), plus a global seed setter.
+Imported by scripts and modules to keep runs reproducible and consistent.
+"""
 
 
 from dataclasses import dataclass
