@@ -32,7 +32,14 @@ def save_csv(path: Union[Path, str], rows: Iterable[Dict]) -> None:
         # Avoid creating empty CSVs.
         return
     with path.open("w", newline="", encoding="utf-8") as f:
-        # Use keys from the first row as column order.
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        # Use keys from the first row as column order, then append new keys seen later.
+        fieldnames = list(rows[0].keys())
+        seen = set(fieldnames)
+        for row in rows[1:]:
+            for key in row.keys():
+                if key not in seen:
+                    fieldnames.append(key)
+                    seen.add(key)
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)

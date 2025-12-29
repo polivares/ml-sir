@@ -87,3 +87,18 @@ target/
 
 # Mypy cache
 .mypy_cache/
+
+# Local AI agent instructions (do not commit)
+AGENTS.md
+
+# Local human runbook (do not commit)
+HUMAN.md
+HUMAND.md
+
+# Experiment log (auto-updated)
+EXPERIMENTS.md
+
+# Run outputs (experiments, logs, figures, predictions)
+runs/*
+!runs/README.md
+data/processed/

@@ -11,9 +11,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-from pathlib import Path
 import json
+import logging
+from pathlib import Path
 from typing import Dict, List
+
+from src.sir.logging_utils import setup_logging
 
 
 def _parse_args() -> argparse.Namespace:
@@ -22,6 +25,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--runs-dir", type=str, default="runs")
     parser.add_argument("--out", type=str, default="runs/summary.csv")
     parser.add_argument("--include-config", action="store_true")
+    parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument("--no-log-file", action="store_true")
+    parser.add_argument("--no-console-log", action="store_true")
     return parser.parse_args()
 
 
@@ -41,6 +48,14 @@ def main() -> None:
     args = _parse_args()
     runs_dir = Path(args.runs_dir)
     out_path = Path(args.out)
+
+    log_file = None
+    if not args.no_log_file:
+        log_file = Path(args.log_file) if args.log_file else out_path.with_suffix(".log")
+    setup_logging(level=args.log_level, log_file=log_file, console=not args.no_console_log)
+    logger = logging.getLogger(__name__)
+
+    logger.info("Aggregating metrics under %s", runs_dir)
 
     rows: List[Dict] = []
 
@@ -66,7 +81,7 @@ def main() -> None:
                 rows.append(row)
 
     if not rows:
-        print("No metrics.csv files found under", runs_dir)
+        logger.warning("No metrics.csv files found under %s", runs_dir)
         return
 
     # Build a union of all keys to avoid dropping columns.
@@ -79,7 +94,7 @@ def main() -> None:
         writer.writeheader()
         writer.writerows(rows)
 
-    print(f"Wrote {len(rows)} rows to {out_path}")
+    logger.info("Wrote %d rows to %s", len(rows), out_path)
 
 
 if __name__ == "__main__":

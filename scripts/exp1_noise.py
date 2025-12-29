@@ -13,7 +13,10 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import logging
 from pathlib import Path
+import time
+from typing import Optional
 
 import numpy as np
 
@@ -29,6 +32,9 @@ from src.sir.noise import observe_poisson, observe_negbin
 from src.sir.baseline import fit_poisson_mle, fit_negbin_mle
 from src.sir.io import ensure_dir, save_json, save_csv
 from src.sir.cache import hash_config, cache_exists, load_cache, save_cache
+from src.sir.logging_utils import setup_logging
+from src.sir.experiment_log import update_experiment_log, summarize_args
+from src.sir.predictions import save_predictions
 from src.sir import ml
 
 
@@ -50,16 +56,30 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--k-range", type=float, nargs=2, default=(5.0, 50.0))
     parser.add_argument("--p-poisson", type=float, default=0.5)
     parser.add_argument("--n-starts", type=int, default=5)
-    parser.add_argument("--max-test", type=int, default=200)
+    parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--run-mlp", action="store_true")
     parser.add_argument("--run-mlp-branched", action="store_true")
     parser.add_argument("--run-cnn1d", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--save-plots", action="store_true")
+    parser.add_argument("--save-plot-data", action="store_true")
+    parser.add_argument("--n-plot", type=int, default=9)
+    parser.add_argument("--plot-dir", type=str, default=None)
+    parser.add_argument("--save-predictions", action="store_true")
+    parser.add_argument("--pred-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="data/processed/sir")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument("--no-log-file", action="store_true")
+    parser.add_argument("--no-console-log", action="store_true")
+    parser.add_argument("--exp-log", type=str, default="EXPERIMENTS.md")
+    parser.add_argument("--mark-final", action="store_true")
+    parser.add_argument("--final-note", type=str, default=None)
     return parser.parse_args()
 
 
@@ -98,8 +118,15 @@ def _apply_mixed_noise(
     return out
 
 
-def _subset(arr: np.ndarray, max_n: int, rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
+def _subset(
+    arr: np.ndarray,
+    max_n: Optional[int],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
     # Optionally cap the number of curves to keep runtime bounded.
+    if max_n is None or max_n <= 0:
+        idx = np.arange(arr.shape[0])
+        return arr, idx
     if arr.shape[0] <= max_n:
         idx = np.arange(arr.shape[0])
         return arr, idx
@@ -107,10 +134,41 @@ def _subset(arr: np.ndarray, max_n: int, rng: np.random.Generator) -> tuple[np.n
     return arr[idx], idx
 
 
+def _choose_plot_indices(pool: np.ndarray, n_plot: int, rng: np.random.Generator) -> np.ndarray:
+    """Choose a reproducible subset of indices for plotting."""
+    if pool.size <= n_plot:
+        return np.sort(pool)
+    return np.sort(rng.choice(pool, size=n_plot, replace=False))
+
+
 def main() -> None:
     args = _parse_args()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULTS.runs_dir / f"exp1_{timestamp}"
+    ensure_dir(out_dir)
+
+    log_file = None
+    if not args.no_log_file:
+        log_file = Path(args.log_file) if args.log_file else out_dir / "run.log"
+    setup_logging(level=args.log_level, log_file=log_file, console=not args.no_console_log)
+    logger = logging.getLogger(__name__)
+
+    logger.info("Exp1 start")
+    logger.info("Output dir: %s", out_dir)
+
     set_global_seed(args.seed)
     rng = np.random.default_rng(args.seed)
+
+    logger.info(
+        "Config: noise=%s train-mode=%s rho=%s k=%s n-starts=%s seed=%s normalize=%s",
+        args.noise,
+        args.train_mode,
+        args.rho,
+        args.k,
+        args.n_starts,
+        args.seed,
+        args.normalize,
+    )
 
     # Cache derived arrays + splits to avoid recomputation.
     cache_config = {
@@ -121,9 +179,11 @@ def main() -> None:
         "val_size": args.val_size,
     }
     cache_key = hash_config(cache_config)
+    logger.info("Cache key: %s", cache_key)
 
     if not args.no_cache and cache_exists(args.cache_dir, cache_key):
         # Fast path: load arrays and split indices from cache.
+        logger.info("Loading cached arrays from %s", args.cache_dir)
         arrays, _ = load_cache(args.cache_dir, cache_key)
         X = arrays["X"]
         y = arrays["y"]
@@ -141,6 +201,7 @@ def main() -> None:
         }
     else:
         # Load simulations and build supervised dataset.
+        logger.info("Loading sir.pkl from %s (limit=%s)", args.data_path, args.limit)
         data = load_sir_pkl(args.data_path, limit=args.limit, rng=rng)
         X, y = build_Xy_I_only(data, normalize=None)
         # Store population size per curve for optional normalization.
@@ -150,6 +211,7 @@ def main() -> None:
             X, y, test_size=args.test_size, val_size=args.val_size, rng=rng, return_indices=True
         )
         if not args.no_cache:
+            logger.info("Saving cache to %s", args.cache_dir)
             save_cache(
                 args.cache_dir,
                 cache_key,
@@ -174,6 +236,14 @@ def main() -> None:
     pop_val = pop[splits["idx_val"]]
     pop_test = pop[splits["idx_test"]]
 
+    logger.info(
+        "Dataset shapes: train=%s val=%s test=%s (T=%s)",
+        splits["X_train"].shape,
+        splits["X_val"].shape,
+        splits["X_test"].shape,
+        splits["X_train"].shape[1],
+    )
+
     # Train/val observations (raw counts).
     if args.train_mode == "clean":
         X_train_obs = X_train
@@ -192,14 +262,17 @@ def main() -> None:
 
     # Test observations (always noisy for Exp1, raw counts).
     X_test_obs = _apply_noise_batch(X_test, args.noise, args.rho, args.k, rng)
+    logger.info("Applied observation noise to test set (noise=%s)", args.noise)
 
     results = []
 
     # Baseline MLE per curve (multi-start).
     X_test_fit, idx_fit = _subset(X_test_obs, args.max_test, rng)
     y_test_fit = y_test[idx_fit]
+    logger.info("Baseline MLE fitting on %d curves", X_test_fit.shape[0])
     y_pred = []
     fit_times = []
+    start = time.perf_counter()
     for i in range(X_test_fit.shape[0]):
         local_rng = np.random.default_rng(args.seed + i)
         if args.noise == "poisson":
@@ -221,8 +294,18 @@ def main() -> None:
             )
         y_pred.append(fit.params[:2])
         fit_times.append(sum(fit.times))
+        if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
+            elapsed = time.perf_counter() - start
+            avg = elapsed / (i + 1)
+            logger.info(
+                "Baseline progress: %d/%d curves (avg %.3fs/curve)",
+                i + 1,
+                X_test_fit.shape[0],
+                avg,
+            )
 
     y_pred = np.asarray(y_pred)
+    baseline_pred = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
     metrics = per_param_metrics(y_test_fit, y_pred)
     metrics.update(timing_summary(np.asarray(fit_times)))
     metrics.update({
@@ -232,14 +315,22 @@ def main() -> None:
     })
     results.append(metrics)
 
+    y_pred_mlp = None
+    y_pred_mlp_branched = None
+    y_pred_cnn1d = None
+
     # ML models (optional)
     if args.run_mlp or args.run_mlp_branched or args.run_cnn1d:
         # Normalize with the same strategy across train/val/test.
+        logger.info("Preparing normalized inputs for ML (method=%s)", args.normalize)
         X_train_in = normalize_series(X_train_obs, method=args.normalize, population=pop_train)
         X_val_in = normalize_series(X_val_obs, method=args.normalize, population=pop_val)
         X_test_in = normalize_series(X_test_obs, method=args.normalize, population=pop_test)
+    else:
+        logger.info("Skipping ML models (no --run-* flags)")
 
     if args.run_mlp:
+        logger.info("Training MLP")
         model = ml.build_mlp(input_dim=X_train_in.shape[1])
         train_res = ml.train_model(
             model,
@@ -251,8 +342,9 @@ def main() -> None:
             patience=args.patience,
             batch_size=args.batch_size,
         )
-        y_pred = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred)
+        logger.info("MLP training done (train_time_sec=%.2f)", train_res.train_time_sec)
+        y_pred_mlp = model.predict(X_test_in, verbose=0)
+        metrics = per_param_metrics(y_test, y_pred_mlp)
         metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
         metrics.update({
             "method": "mlp",
@@ -263,6 +355,7 @@ def main() -> None:
         results.append(metrics)
 
     if args.run_mlp_branched:
+        logger.info("Training branched MLP")
         model = ml.build_mlp_branched(input_dim=X_train_in.shape[1])
         train_res = ml.train_model(
             model,
@@ -274,8 +367,9 @@ def main() -> None:
             patience=args.patience,
             batch_size=args.batch_size,
         )
-        y_pred = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred)
+        logger.info("Branched MLP training done (train_time_sec=%.2f)", train_res.train_time_sec)
+        y_pred_mlp_branched = model.predict(X_test_in, verbose=0)
+        metrics = per_param_metrics(y_test, y_pred_mlp_branched)
         metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
         metrics.update({
             "method": "mlp_branched",
@@ -286,6 +380,7 @@ def main() -> None:
         results.append(metrics)
 
     if args.run_cnn1d:
+        logger.info("Training CNN1D")
         model = ml.build_cnn1d(input_len=X_train_in.shape[1])
         train_res = ml.train_model(
             model,
@@ -297,8 +392,9 @@ def main() -> None:
             patience=args.patience,
             batch_size=args.batch_size,
         )
-        y_pred = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred)
+        logger.info("CNN1D training done (train_time_sec=%.2f)", train_res.train_time_sec)
+        y_pred_cnn1d = model.predict(X_test_in, verbose=0)
+        metrics = per_param_metrics(y_test, y_pred_cnn1d)
         metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
         metrics.update({
             "method": "cnn1d",
@@ -308,15 +404,227 @@ def main() -> None:
         })
         results.append(metrics)
 
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    out_dir = Path(args.out_dir) if args.out_dir else DEFAULTS.runs_dir / f"exp1_{timestamp}"
-    ensure_dir(out_dir)
-
     # Persist run configuration and metrics for aggregation.
     config = vars(args)
     config.update({"timestamp": timestamp})
     save_json(out_dir / "config.json", config)
     save_csv(out_dir / "metrics.csv", results)
+    logger.info("Saved metrics to %s", out_dir / "metrics.csv")
+
+    if args.save_predictions:
+        pred_dir = Path(args.pred_dir) if args.pred_dir else out_dir
+        ensure_dir(pred_dir)
+        times = DEFAULTS.t0 + np.arange(X_test.shape[1]) * DEFAULTS.dt
+        y_pred_by_method = {}
+
+        baseline_full = np.full_like(y_test, np.nan, dtype=float)
+        if idx_fit.size > 0:
+            baseline_full[idx_fit] = y_pred
+        y_pred_by_method[f"baseline_mle_{args.noise}"] = baseline_full
+        if y_pred_mlp is not None:
+            y_pred_by_method["mlp"] = y_pred_mlp
+        if y_pred_mlp_branched is not None:
+            y_pred_by_method["mlp_branched"] = y_pred_mlp_branched
+        if y_pred_cnn1d is not None:
+            y_pred_by_method["cnn1d"] = y_pred_cnn1d
+
+        save_predictions(
+            pred_dir,
+            times=times,
+            i_true=X_test,
+            i_obs=X_test_obs,
+            y_true=y_test,
+            y_pred_by_method=y_pred_by_method,
+            idx_test=splits["idx_test"],
+            idx_fit=idx_fit,
+            metadata={
+                "exp": "exp1",
+                "noise": args.noise,
+                "train_mode": args.train_mode,
+                "rho": float(args.rho),
+                "k": float(args.k),
+                "estimate_rho": bool(args.estimate_rho),
+                "seed": args.seed,
+                "s0": DEFAULTS.s0,
+                "i0": DEFAULTS.i0,
+                "r0": DEFAULTS.r0,
+                "t0": DEFAULTS.t0,
+                "dt": DEFAULTS.dt,
+            },
+        )
+        logger.info("Saved predictions to %s", pred_dir)
+
+    if args.save_plots or args.save_plot_data:
+        from src.visualization import visualize as viz
+        from src.sir.simulate import simulate_sir
+
+        plot_dir = Path(args.plot_dir) if args.plot_dir else out_dir / "figures"
+        ensure_dir(plot_dir)
+        logger.info("Saving plots/plot-data to %s", plot_dir)
+
+        plot_rng = np.random.default_rng(args.seed + 12345)
+        plot_pool = idx_fit if idx_fit.size > 0 else np.arange(X_test.shape[0])
+        plot_idx = _choose_plot_indices(plot_pool, args.n_plot, plot_rng)
+
+        t1_eff = DEFAULTS.t0 + DEFAULTS.dt * (X_test.shape[1] - 1)
+        times = DEFAULTS.t0 + np.arange(X_test.shape[1]) * DEFAULTS.dt
+
+        curves_list = []
+        error_list = []
+        for idx in plot_idx:
+            curves = {
+                "I_true": X_test[idx],
+                "Y_obs": X_test_obs[idx],
+            }
+            errors = {}
+            if idx in baseline_pred:
+                params = baseline_pred[int(idx)]
+                I_pred = simulate_sir(
+                    params[0],
+                    params[1],
+                    s0=DEFAULTS.s0,
+                    i0=DEFAULTS.i0,
+                    r0=DEFAULTS.r0,
+                    t0=DEFAULTS.t0,
+                    t1=t1_eff,
+                    dt=DEFAULTS.dt,
+                )
+                curves["I_pred_baseline"] = I_pred
+                errors["baseline_mle"] = np.abs(I_pred - X_test[idx])
+
+            if y_pred_mlp is not None:
+                params = y_pred_mlp[idx]
+                I_pred = simulate_sir(
+                    params[0],
+                    params[1],
+                    s0=DEFAULTS.s0,
+                    i0=DEFAULTS.i0,
+                    r0=DEFAULTS.r0,
+                    t0=DEFAULTS.t0,
+                    t1=t1_eff,
+                    dt=DEFAULTS.dt,
+                )
+                curves["I_pred_mlp"] = I_pred
+                errors["mlp"] = np.abs(I_pred - X_test[idx])
+
+            if y_pred_mlp_branched is not None:
+                params = y_pred_mlp_branched[idx]
+                I_pred = simulate_sir(
+                    params[0],
+                    params[1],
+                    s0=DEFAULTS.s0,
+                    i0=DEFAULTS.i0,
+                    r0=DEFAULTS.r0,
+                    t0=DEFAULTS.t0,
+                    t1=t1_eff,
+                    dt=DEFAULTS.dt,
+                )
+                curves["I_pred_mlp_branched"] = I_pred
+                errors["mlp_branched"] = np.abs(I_pred - X_test[idx])
+
+            if y_pred_cnn1d is not None:
+                params = y_pred_cnn1d[idx]
+                I_pred = simulate_sir(
+                    params[0],
+                    params[1],
+                    s0=DEFAULTS.s0,
+                    i0=DEFAULTS.i0,
+                    r0=DEFAULTS.r0,
+                    t0=DEFAULTS.t0,
+                    t1=t1_eff,
+                    dt=DEFAULTS.dt,
+                )
+                curves["I_pred_cnn1d"] = I_pred
+                errors["cnn1d"] = np.abs(I_pred - X_test[idx])
+
+            curves_list.append(curves)
+            error_list.append(errors)
+
+        y_true_plot = y_test_fit
+        y_pred_by_method = {f"baseline_mle_{args.noise}": y_pred}
+        if y_pred_mlp is not None:
+            y_pred_by_method["mlp"] = y_pred_mlp[idx_fit]
+        if y_pred_mlp_branched is not None:
+            y_pred_by_method["mlp_branched"] = y_pred_mlp_branched[idx_fit]
+        if y_pred_cnn1d is not None:
+            y_pred_by_method["cnn1d"] = y_pred_cnn1d[idx_fit]
+
+        if args.save_plots:
+            viz.save_experiment_figures(
+                plot_dir,
+                times,
+                curves_list,
+                error_list,
+                y_true_plot,
+                y_pred_by_method,
+                results,
+                title_prefix=f"Exp1 (noise={args.noise})",
+            )
+
+        if args.save_plot_data:
+            viz.save_plot_data(
+                plot_dir,
+                times,
+                plot_idx,
+                curves_list,
+                error_list,
+                y_true_plot,
+                y_pred_by_method,
+                idx_fit=idx_fit,
+                metadata={
+                    "exp": "exp1",
+                    "noise": args.noise,
+                    "train_mode": args.train_mode,
+                    "rho": float(args.rho),
+                    "k": float(args.k),
+                    "seed": args.seed,
+                    "n_plot": int(args.n_plot),
+                },
+            )
+
+    artifacts = ["config.json", "metrics.csv", "run.log"]
+    if args.save_predictions:
+        artifacts.append("predictions.npz/json")
+    if args.save_plots or args.save_plot_data:
+        artifacts.append("figures/")
+
+    args_summary = summarize_args(
+        vars(args),
+        keys=[
+            "noise",
+            "train_mode",
+            "rho",
+            "k",
+            "estimate_rho",
+            "limit",
+            "max_test",
+            "n_starts",
+            "seed",
+            "normalize",
+            "run_mlp",
+            "run_mlp_branched",
+            "run_cnn1d",
+            "epochs",
+            "patience",
+            "batch_size",
+            "save_plots",
+            "save_plot_data",
+            "save_predictions",
+        ],
+    )
+    title = f"{timestamp} — Exp1 (noise={args.noise}, train={args.train_mode})"
+    update_experiment_log(
+        args.exp_log,
+        exp_key="exp1",
+        title=title,
+        run_dir=out_dir,
+        script="scripts/exp1_noise.py",
+        args_summary=args_summary,
+        artifacts=artifacts,
+        metrics_rows=results,
+        mark_final=args.mark_final,
+        final_note=args.final_note,
+    )
 
 
 if __name__ == "__main__":

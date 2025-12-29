@@ -29,7 +29,27 @@ def r2(y_true: np.ndarray, y_pred: np.ndarray) -> float:
 
 
 def per_param_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Compute MAE/RMSE/R2 per parameter (beta, gamma)."""
+    """Compute MAE/RMSE/R2 per parameter (beta, gamma).
+
+    Parameters
+    ----------
+    y_true, y_pred:
+        Arrays of shape `(n_samples, 2)` where columns are ordered as:
+        - index 0: beta
+        - index 1: gamma
+
+    Returns
+    -------
+    Dict[str, float]
+        A flat dict containing **three metrics per parameter**:
+        - `mae_beta`, `rmse_beta`, `r2_beta`
+        - `mae_gamma`, `rmse_gamma`, `r2_gamma`
+
+    Notes
+    -----
+    This helper only computes the above metrics. It does not include timing metrics
+    (see `timing_summary`) and does not compute any uncertainty/coverage metrics.
+    """
     metrics = {}
     # Parameter order matches y = [beta, gamma] with shape (n_samples, 2).
     for idx, name in enumerate(["beta", "gamma"]):

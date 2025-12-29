@@ -1,8 +1,9 @@
 """Central defaults for SIR benchmarks.
 
 Defines the Defaults dataclass with shared experiment settings (ranges,
-time grid, split sizes, data paths), plus a global seed setter.
-Imported by scripts and modules to keep runs reproducible and consistent.
+time grid, split sizes, data paths), plus a global seed setter and
+TensorFlow GPU memory configuration. Imported by scripts and modules to
+keep runs reproducible and consistent.
 """
 
 
@@ -47,7 +48,30 @@ def set_global_seed(seed: int) -> None:
     try:
         import tensorflow as tf
 
+        configure_tensorflow_memory_growth(tf)
         tf.random.set_seed(seed)
     except Exception:
         # TensorFlow may not be installed; ignore if unavailable.
         pass
+
+
+def configure_tensorflow_memory_growth(tf_module=None) -> None:
+    """Enable TensorFlow GPU memory growth if GPUs are available."""
+    try:
+        tf = tf_module
+        if tf is None:
+            import tensorflow as tf  # type: ignore
+    except Exception:
+        return
+
+    try:
+        gpus = tf.config.list_physical_devices("GPU")
+    except Exception:
+        return
+
+    for gpu in gpus:
+        try:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        except Exception:
+            # Safe to ignore if already initialized or unsupported.
+            pass

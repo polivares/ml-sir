@@ -24,6 +24,9 @@ def _require_tf():
     try:
         import tensorflow as tf
 
+        from src.sir.config import configure_tensorflow_memory_growth
+
+        configure_tensorflow_memory_growth(tf)
         return tf
     except Exception as exc:
         # Fail fast if TensorFlow is not available.
