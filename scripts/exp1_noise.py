@@ -1,6 +1,12 @@
-"""Exp1: observation-noise benchmark.
+"""Exp1 benchmark for observation noise robustness.
 
-Adds Poisson/NegBin noise, fits MLE baselines, and optionally trains ML models."""
+Adds Poisson or Negative Binomial noise to I(t), fits MLE baselines, and
+optionally trains ML models under different train modes (clean/noisy/mixed).
+This evaluates how well methods generalize when observations are noisy.
+Writes a run folder with config.json and metrics.csv under runs/.
+Typical usage:
+  python scripts/exp1_noise.py --noise poisson --train-mode mixed --run-mlp
+"""
 
 
 from __future__ import annotations

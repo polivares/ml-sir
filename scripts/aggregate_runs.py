@@ -1,6 +1,10 @@
-"""Aggregate metrics across runs.
+"""Aggregate metrics across benchmark runs.
 
-Merges runs/*/metrics.csv into runs/summary.csv (optionally with config)."""
+Scans runs/*/metrics.csv, adds run metadata (and optionally config values),
+and writes a single summary CSV for analysis.
+Typical usage:
+  python scripts/aggregate_runs.py --include-config
+"""
 
 
 from __future__ import annotations

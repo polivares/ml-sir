@@ -1,6 +1,12 @@
-"""Exp2: windowing/downsampling benchmark.
+"""Exp2 benchmark for partial windows and downsampling.
 
-Evaluates performance under partial windows and lower temporal resolution."""
+Applies early-window truncation and/or temporal downsampling to I(t) before
+fitting, to mimic partial observation windows and lower reporting frequency.
+The classical fit is adjusted for the effective dt and t1.
+Writes a run folder with config.json and metrics.csv under runs/.
+Typical usage:
+  python scripts/exp2_window_downsample.py --window-days 30 --downsample 5
+"""
 
 
 from __future__ import annotations

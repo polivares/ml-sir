@@ -1,6 +1,12 @@
-"""Exp0: clean-data benchmark.
+"""Exp0 benchmark on clean simulated SIR curves.
 
-Runs classical MSE fitting (and optional ML) on clean I(t), writing metrics to runs/."""
+Loads sir.pkl simulations, builds a train/val/test split, fits the classical
+MSE optimizer per curve, and optionally trains neural models (MLP/CNN1D).
+This is the clean-data baseline for the benchmark suite.
+Writes a run folder with config.json and metrics.csv under runs/.
+Typical usage:
+  python scripts/exp0_run.py --run-mlp --normalize max
+"""
 
 
 from __future__ import annotations
