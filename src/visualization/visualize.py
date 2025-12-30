@@ -10,6 +10,8 @@ This module provides reusable Matplotlib helpers to visualize:
 It can also be used as a script to build plots from saved experiment
 artifacts (predictions.npz/json and optionally metrics.csv), e.g.:
   python -m src.visualization.visualize --predictions runs/exp0_.../predictions.npz
+The plotting script limits the number of ML methods by default (for readability);
+override with --plot-max-ml/--plot-max-baseline when needed.
 """
 
 from __future__ import annotations
@@ -33,7 +35,14 @@ def save_figure(fig: plt.Figure, path: Path | str, dpi: int = 150) -> Path:
     """Save a Matplotlib figure and ensure the parent directory exists."""
     path = Path(path)
     ensure_dir(path.parent)
-    fig.tight_layout()
+    has_suptitle = getattr(fig, "_suptitle", None) is not None
+    has_legend = bool(fig.legends)
+    top = 0.93 if has_suptitle else 1.0
+    bottom = 0.12 if has_legend else 0.0
+    if top < 1.0 or bottom > 0.0:
+        fig.tight_layout(rect=(0.0, bottom, 1.0, top))
+    else:
+        fig.tight_layout()
     fig.savefig(path, dpi=dpi, bbox_inches="tight")
     return path
 
@@ -138,6 +147,176 @@ def _filter_pairs(
     return y_true[mask], y_pred[mask]
 
 
+def _method_from_curve_label(label: str) -> Optional[str]:
+    if label.startswith("I_pred_"):
+        return label[len("I_pred_"):]
+    return None
+
+
+def _method_score_from_row(row: Mapping[str, object]) -> Optional[float]:
+    def _get(key: str) -> Optional[float]:
+        value = row.get(key)
+        if value is None:
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(v):
+            return None
+        return v
+
+    mae_beta = _get("mae_beta")
+    mae_gamma = _get("mae_gamma")
+    if mae_beta is not None or mae_gamma is not None:
+        vals = [v for v in (mae_beta, mae_gamma) if v is not None]
+        return float(np.mean(vals)) if vals else None
+
+    rmse_beta = _get("rmse_beta")
+    rmse_gamma = _get("rmse_gamma")
+    if rmse_beta is not None or rmse_gamma is not None:
+        vals = [v for v in (rmse_beta, rmse_gamma) if v is not None]
+        return float(np.mean(vals)) if vals else None
+
+    r2_beta = _get("r2_beta")
+    r2_gamma = _get("r2_gamma")
+    if r2_beta is not None or r2_gamma is not None:
+        vals = [v for v in (r2_beta, r2_gamma) if v is not None]
+        return -float(np.mean(vals)) if vals else None
+
+    return None
+
+
+def _rank_methods(
+    y_true: np.ndarray,
+    y_pred_by_method: Mapping[str, np.ndarray],
+    results: Sequence[Mapping[str, object]],
+) -> List[str]:
+    scores: Dict[str, float] = {}
+    for row in results:
+        method = row.get("method")
+        if not method:
+            continue
+        score = _method_score_from_row(row)
+        if score is not None:
+            scores[str(method)] = score
+
+    if not scores:
+        for method, y_pred in y_pred_by_method.items():
+            y_true_f, y_pred_f = _filter_pairs(y_true, y_pred)
+            if y_true_f.size == 0:
+                scores[method] = np.inf
+                continue
+            err = np.abs(y_pred_f - y_true_f)
+            scores[method] = float(np.mean(err))
+
+    methods = list(y_pred_by_method.keys())
+    return sorted(methods, key=lambda m: (scores.get(m, np.inf), str(m)))
+
+
+def _filter_pred_by_method(
+    y_pred_by_method: Mapping[str, np.ndarray],
+    allowed: Sequence[str],
+) -> Dict[str, np.ndarray]:
+    allowed_set = set(allowed)
+    return {k: v for k, v in y_pred_by_method.items() if k in allowed_set}
+
+
+def _filter_curves_list(
+    curves_list: Sequence[Mapping[str, np.ndarray]],
+    allowed_methods: Sequence[str],
+) -> List[Dict[str, np.ndarray]]:
+    allowed = set(allowed_methods)
+    filtered: List[Dict[str, np.ndarray]] = []
+    for curves in curves_list:
+        out: Dict[str, np.ndarray] = {}
+        for label, series in curves.items():
+            if label in ("I_true", "I_obs", "Y_obs"):
+                out[label] = series
+                continue
+            method = _method_from_curve_label(label)
+            if method and method in allowed:
+                out[label] = series
+        filtered.append(out)
+    return filtered
+
+
+def _filter_error_list(
+    error_list: Sequence[Mapping[str, np.ndarray]],
+    allowed_methods: Sequence[str],
+) -> List[Dict[str, np.ndarray]]:
+    allowed = set(allowed_methods)
+    filtered: List[Dict[str, np.ndarray]] = []
+    for errors in error_list:
+        out = {label: series for label, series in errors.items() if label in allowed}
+        filtered.append(out)
+    return filtered
+
+
+def _build_color_map(method_order: Sequence[str]) -> Dict[str, Tuple[float, float, float, float]]:
+    cmap = plt.get_cmap("tab20")
+    colors = [cmap(i % 20) for i in range(len(method_order))]
+    return {method: colors[i] for i, method in enumerate(method_order)}
+
+
+def _style_for_label(label: str, method: Optional[str], color_map: Mapping[str, object]) -> Dict[str, object]:
+    if label == "I_true":
+        return {"color": "black", "linewidth": 2.2, "zorder": 5}
+    if label in ("I_obs", "Y_obs"):
+        return {"color": "gray", "linewidth": 1.2, "linestyle": ":", "alpha": 0.8}
+    if method and method.startswith("baseline_"):
+        return {"color": color_map.get(method), "linewidth": 1.6, "linestyle": "--", "alpha": 0.9}
+    if method:
+        return {"color": color_map.get(method), "linewidth": 1.1, "alpha": 0.9}
+    return {"linewidth": 1.0, "alpha": 0.8}
+
+
+def _label_to_method(label: str) -> Optional[str]:
+    if label in ("I_true", "I_obs", "Y_obs"):
+        return None
+    method = _method_from_curve_label(label)
+    return method if method is not None else label
+
+
+def _legend_label(label: str) -> str:
+    if label.startswith("I_pred_"):
+        return label[len("I_pred_"):]
+    return label
+
+
+def _order_labels(labels: Sequence[str], method_order: Optional[Sequence[str]]) -> List[str]:
+    labels = list(labels)
+    if not method_order:
+        return labels
+    order = {method: idx for idx, method in enumerate(method_order)}
+
+    def _key(label: str) -> Tuple[int, int, str]:
+        if label == "I_true":
+            return (-2, -1, label)
+        if label in ("I_obs", "Y_obs"):
+            return (-1, -1, label)
+        method = _label_to_method(label)
+        if method in order:
+            return (0, order[method], label)
+        return (1, len(order), label)
+
+    return sorted(labels, key=_key)
+
+
+def _order_methods(methods: Iterable[str], method_order: Optional[Sequence[str]]) -> List[str]:
+    methods_set = {str(m) for m in methods}
+    if not method_order:
+        return sorted(methods_set)
+    ordered: List[str] = []
+    for method in method_order:
+        if method in methods_set:
+            ordered.append(method)
+    for method in sorted(methods_set):
+        if method not in ordered:
+            ordered.append(method)
+    return ordered
+
+
 def plot_curve_comparison(
     times: np.ndarray,
     curves: Mapping[str, np.ndarray],
@@ -145,15 +324,21 @@ def plot_curve_comparison(
     xlabel: str = "t",
     ylabel: str = "I(t)",
     ax: Optional[plt.Axes] = None,
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
 ) -> plt.Axes:
     """Plot multiple curves on the same axis for comparison."""
     ax = ax or plt.gca()
-    for label, series in curves.items():
+    color_map = color_map or {}
+    for label in _order_labels(curves.keys(), method_order):
+        series = curves.get(label)
         if series is None:
             continue
         series = np.asarray(series)
         t = times[: series.shape[-1]]
-        ax.plot(t, series, label=label)
+        method = _label_to_method(label)
+        style = _style_for_label(label, method, color_map)
+        ax.plot(t, series, label=_legend_label(label), **style)
     if title:
         ax.set_title(title)
     ax.set_xlabel(xlabel)
@@ -168,8 +353,11 @@ def plot_curves_grid(
     title: Optional[str] = None,
     xlabel: str = "t",
     ylabel: str = "I(t)",
-    legend: str = "first",
+    legend: str = "global",
     figsize: Optional[Tuple[float, float]] = None,
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
+    legend_ncol: Optional[int] = None,
 ) -> plt.Figure:
     """Plot a grid of curve comparisons (one panel per sample)."""
     n = len(curves_list)
@@ -186,16 +374,43 @@ def plot_curves_grid(
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=figsize, squeeze=False)
     axes = axes.ravel()
+    legend_handles = None
+    legend_labels = None
 
     for i, curves in enumerate(curves_list):
         ax = axes[i]
-        plot_curve_comparison(times, curves, xlabel=xlabel, ylabel=ylabel, ax=ax)
+        plot_curve_comparison(
+            times,
+            curves,
+            xlabel=xlabel,
+            ylabel=ylabel,
+            ax=ax,
+            method_order=method_order,
+            color_map=color_map,
+        )
         ax.set_title(f"Sample {i + 1}")
         if legend == "all" or (legend == "first" and i == 0):
             ax.legend(fontsize=8)
+        if legend == "global" and legend_handles is None:
+            handles, labels = ax.get_legend_handles_labels()
+            if labels:
+                legend_handles, legend_labels = handles, labels
 
     for j in range(i + 1, len(axes)):
         axes[j].axis("off")
+
+    if legend == "global" and legend_handles:
+        if legend_ncol is None:
+            legend_ncol = min(len(legend_labels), max(1, n_cols + 1))
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=legend_ncol,
+            frameon=False,
+            fontsize=8,
+        )
+        fig.subplots_adjust(bottom=0.16)
 
     if title:
         fig.suptitle(title)
@@ -208,31 +423,61 @@ def plot_param_scatter(
     param_names: Tuple[str, str] = ("beta", "gamma"),
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (10, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
+    legend: str = "global",
 ) -> plt.Figure:
     """Scatter true vs predicted parameters for multiple methods."""
     y_true = np.asarray(y_true)
     fig, axes = plt.subplots(1, 2, figsize=figsize)
+    labels = _order_methods(y_pred_by_label.keys(), method_order)
+    color_map = color_map or {}
+    legend_handles = None
+    legend_labels = None
 
     for p_idx, pname in enumerate(param_names):
         ax = axes[p_idx]
         y_min = float(np.min(y_true[:, p_idx]))
         y_max = float(np.max(y_true[:, p_idx]))
         ax.plot([y_min, y_max], [y_min, y_max], "k--", lw=1, label="perfect")
-        for label, y_pred in y_pred_by_label.items():
+        for label in labels:
+            y_pred = y_pred_by_label.get(label)
             if y_pred is None:
                 continue
             y_pred = np.asarray(y_pred)
             y_true_f, y_pred_f = _filter_pairs(y_true, y_pred)
             if y_true_f.size == 0:
                 continue
-            ax.scatter(y_true_f[:, p_idx], y_pred_f[:, p_idx], s=12, alpha=0.6, label=label)
+            ax.scatter(
+                y_true_f[:, p_idx],
+                y_pred_f[:, p_idx],
+                s=12,
+                alpha=0.6,
+                label=label,
+                color=color_map.get(label),
+            )
         ax.set_xlabel(f"true {pname}")
         ax.set_ylabel(f"pred {pname}")
         ax.set_title(f"{pname} scatter")
-        ax.legend(fontsize=8)
+        if legend == "all" or (legend == "first" and p_idx == 0):
+            ax.legend(fontsize=8)
+        if legend == "global" and legend_handles is None:
+            handles, labels_out = ax.get_legend_handles_labels()
+            if labels_out:
+                legend_handles, legend_labels = handles, labels_out
 
     if title:
         fig.suptitle(title)
+    if legend == "global" and legend_handles:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=min(len(legend_labels), 4),
+            frameon=False,
+            fontsize=8,
+        )
+        fig.subplots_adjust(bottom=0.18)
     return fig
 
 
@@ -244,14 +489,22 @@ def plot_param_error_hist(
     kind: str = "abs",
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (10, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
+    legend: str = "global",
 ) -> plt.Figure:
     """Histogram of parameter errors for multiple methods."""
     y_true = np.asarray(y_true)
     fig, axes = plt.subplots(1, 2, figsize=figsize)
+    labels = _order_methods(y_pred_by_label.keys(), method_order)
+    color_map = color_map or {}
+    legend_handles = None
+    legend_labels = None
 
     for p_idx, pname in enumerate(param_names):
         ax = axes[p_idx]
-        for label, y_pred in y_pred_by_label.items():
+        for label in labels:
+            y_pred = y_pred_by_label.get(label)
             if y_pred is None:
                 continue
             y_pred = np.asarray(y_pred)
@@ -261,14 +514,37 @@ def plot_param_error_hist(
             err = y_pred_f[:, p_idx] - y_true_f[:, p_idx]
             if kind == "abs":
                 err = np.abs(err)
-            ax.hist(err, bins=bins, alpha=0.5, label=label)
+            ax.hist(
+                err,
+                bins=bins,
+                histtype="step",
+                linewidth=1.4,
+                alpha=0.9,
+                label=label,
+                color=color_map.get(label),
+            )
         ax.set_title(f"{pname} error ({kind})")
         ax.set_xlabel("error")
         ax.set_ylabel("count")
-        ax.legend(fontsize=8)
+        if legend == "all" or (legend == "first" and p_idx == 0):
+            ax.legend(fontsize=8)
+        if legend == "global" and legend_handles is None:
+            handles, labels_out = ax.get_legend_handles_labels()
+            if labels_out:
+                legend_handles, legend_labels = handles, labels_out
 
     if title:
         fig.suptitle(title)
+    if legend == "global" and legend_handles:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=min(len(legend_labels), 4),
+            frameon=False,
+            fontsize=8,
+        )
+        fig.subplots_adjust(bottom=0.18)
     return fig
 
 
@@ -279,16 +555,22 @@ def plot_param_error_box(
     kind: str = "abs",
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (10, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
 ) -> plt.Figure:
     """Boxplots of parameter errors for multiple methods."""
     y_true = np.asarray(y_true)
     fig, axes = plt.subplots(1, 2, figsize=figsize)
+    labels_ordered = _order_methods(y_pred_by_label.keys(), method_order)
+    color_map = color_map or {}
 
     for p_idx, pname in enumerate(param_names):
         ax = axes[p_idx]
         data = []
         labels = []
-        for label, y_pred in y_pred_by_label.items():
+        colors = []
+        for label in labels_ordered:
+            y_pred = y_pred_by_label.get(label)
             if y_pred is None:
                 continue
             y_pred = np.asarray(y_pred)
@@ -300,8 +582,14 @@ def plot_param_error_box(
                 err = np.abs(err)
             data.append(err)
             labels.append(label)
+            colors.append(color_map.get(label))
         if data:
-            ax.boxplot(data, labels=labels, showfliers=False)
+            box = ax.boxplot(data, labels=labels, showfliers=False, patch_artist=True)
+            for patch, color in zip(box["boxes"], colors):
+                if color is None:
+                    continue
+                patch.set_facecolor(color)
+                patch.set_alpha(0.4)
         ax.set_title(f"{pname} error ({kind})")
         ax.set_ylabel("error")
         ax.tick_params(axis="x", rotation=45)
@@ -318,14 +606,22 @@ def plot_param_error_cdf(
     kind: str = "abs",
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (10, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
+    legend: str = "global",
 ) -> plt.Figure:
     """CDF of parameter errors for multiple methods."""
     y_true = np.asarray(y_true)
     fig, axes = plt.subplots(1, 2, figsize=figsize)
+    labels = _order_methods(y_pred_by_label.keys(), method_order)
+    color_map = color_map or {}
+    legend_handles = None
+    legend_labels = None
 
     for p_idx, pname in enumerate(param_names):
         ax = axes[p_idx]
-        for label, y_pred in y_pred_by_label.items():
+        for label in labels:
+            y_pred = y_pred_by_label.get(label)
             if y_pred is None:
                 continue
             y_pred = np.asarray(y_pred)
@@ -337,14 +633,29 @@ def plot_param_error_cdf(
                 err = np.abs(err)
             err = np.sort(err)
             cdf = np.arange(1, err.size + 1) / err.size
-            ax.plot(err, cdf, label=label)
+            ax.plot(err, cdf, label=label, color=color_map.get(label))
         ax.set_title(f"{pname} error CDF ({kind})")
         ax.set_xlabel("error")
         ax.set_ylabel("cdf")
-        ax.legend(fontsize=8)
+        if legend == "all" or (legend == "first" and p_idx == 0):
+            ax.legend(fontsize=8)
+        if legend == "global" and legend_handles is None:
+            handles, labels_out = ax.get_legend_handles_labels()
+            if labels_out:
+                legend_handles, legend_labels = handles, labels_out
 
     if title:
         fig.suptitle(title)
+    if legend == "global" and legend_handles:
+        fig.legend(
+            legend_handles,
+            legend_labels,
+            loc="lower center",
+            ncol=min(len(legend_labels), 4),
+            frameon=False,
+            fontsize=8,
+        )
+        fig.subplots_adjust(bottom=0.18)
     return fig
 
 
@@ -353,6 +664,8 @@ def plot_curve_mae_hist(
     bins: int = 30,
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (6, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
 ) -> plt.Figure:
     """Histogram of per-curve MAE from error curves."""
     fig, ax = plt.subplots(1, 1, figsize=figsize)
@@ -370,10 +683,21 @@ def plot_curve_mae_hist(
             if np.isfinite(val):
                 by_method.setdefault(label, []).append(val)
 
-    for label, values in by_method.items():
+    labels = _order_methods(by_method.keys(), method_order)
+    color_map = color_map or {}
+    for label in labels:
+        values = by_method.get(label, [])
         if not values:
             continue
-        ax.hist(values, bins=bins, alpha=0.5, label=label)
+        ax.hist(
+            values,
+            bins=bins,
+            histtype="step",
+            linewidth=1.4,
+            alpha=0.9,
+            label=label,
+            color=color_map.get(label),
+        )
 
     ax.set_xlabel("MAE per curve")
     ax.set_ylabel("count")
@@ -389,6 +713,8 @@ def plot_curve_quantiles(
     quantiles: Tuple[float, float, float] = (0.25, 0.5, 0.75),
     title: Optional[str] = None,
     figsize: Tuple[float, float] = (7, 4),
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
 ) -> plt.Figure:
     """Plot median and quantile bands for each curve label across samples."""
     labels, stacked = stack_curves(curves_list)
@@ -398,12 +724,22 @@ def plot_curve_quantiles(
             fig.suptitle(title)
         return fig
 
-    for li, label in enumerate(labels):
+    ordered_labels = _order_labels(labels, method_order)
+    color_map = color_map or {}
+    label_to_idx = {label: li for li, label in enumerate(labels)}
+    for label in ordered_labels:
+        li = label_to_idx[label]
         series_stack = stacked[li]
         q_vals = np.nanquantile(series_stack, quantiles, axis=0)
         t = times[: q_vals.shape[-1]]
-        ax.plot(t, q_vals[1], label=label)
-        ax.fill_between(t, q_vals[0], q_vals[2], alpha=0.2)
+        method = _label_to_method(label)
+        style = _style_for_label(label, method, color_map)
+        ax.plot(t, q_vals[1], label=_legend_label(label), **style)
+        fill_color = style.get("color")
+        if fill_color is None:
+            ax.fill_between(t, q_vals[0], q_vals[2], alpha=0.2)
+        else:
+            ax.fill_between(t, q_vals[0], q_vals[2], alpha=0.2, color=fill_color)
 
     ax.set_xlabel("t")
     ax.set_ylabel("I(t)")
@@ -420,6 +756,8 @@ def plot_metric_bars(
     title: Optional[str] = None,
     n_cols: int = 3,
     figsize: Optional[Tuple[float, float]] = None,
+    method_order: Optional[Sequence[str]] = None,
+    color_map: Optional[Mapping[str, object]] = None,
 ) -> plt.Figure:
     """Plot bar charts for metrics across methods in a single run."""
     rows = list(rows)
@@ -433,7 +771,14 @@ def plot_metric_bars(
         metric_keys = [k for k in rows[0].keys() if k.startswith(("mae_", "rmse_", "r2_"))]
     metric_keys = list(metric_keys)
 
+    if method_order:
+        order = {method: idx for idx, method in enumerate(method_order)}
+        rows = sorted(
+            rows,
+            key=lambda row: (order.get(str(row.get(label_key, "")), len(order)), str(row.get(label_key, ""))),
+        )
     labels = [str(row.get(label_key, "")) for row in rows]
+    color_map = color_map or {}
     n = len(metric_keys)
     n_cols = min(max(1, n_cols), max(1, n))
     n_rows = int(np.ceil(n / n_cols))
@@ -446,9 +791,18 @@ def plot_metric_bars(
     for i, key in enumerate(metric_keys):
         ax = axes[i]
         values = [float(row.get(key, np.nan)) for row in rows]
-        ax.bar(labels, values)
+        pairs = list(zip(labels, values))
+        if key.startswith("r2_"):
+            pairs.sort(key=lambda pair: (not np.isfinite(pair[1]), -pair[1]))
+        else:
+            pairs.sort(key=lambda pair: (not np.isfinite(pair[1]), pair[1]))
+        labels_sorted = [p[0] for p in pairs]
+        values_sorted = [p[1] for p in pairs]
+        colors = [color_map.get(label) for label in labels_sorted]
+        ax.barh(labels_sorted, values_sorted, color=colors)
         ax.set_title(key)
-        ax.tick_params(axis="x", rotation=45)
+        ax.grid(axis="x", linestyle=":", alpha=0.4)
+        ax.invert_yaxis()
 
     for j in range(i + 1, len(axes)):
         axes[j].axis("off")
@@ -529,7 +883,7 @@ def plot_architectures_summary(
 
     if labels_selected and set(labels_selected) != set(labels_in_file):
         lines.append("")
-        lines.append("Selected subset (--methods):")
+        lines.append("Selected subset (plotting):")
         lines.extend(textwrap.wrap(", ".join(sorted(labels_selected)), width=95))
 
     ax.text(
@@ -555,53 +909,99 @@ def save_experiment_figures(
     y_pred_by_method: Mapping[str, np.ndarray],
     results: Sequence[Mapping[str, object]],
     title_prefix: str,
+    max_ml_methods: Optional[int] = 4,
+    max_baseline_methods: Optional[int] = None,
+    legend: str = "global",
 ) -> Dict[str, Path]:
-    """Save the standard set of figures for an experiment."""
+    """Save the standard set of figures for an experiment.
+
+    By default, plots include all baselines plus the top-k ML methods (ranked by
+    parameter error) to keep figures readable; override with max_* arguments.
+    """
     plot_dir = Path(plot_dir)
     ensure_dir(plot_dir)
 
     paths: Dict[str, Path] = {}
+    method_order = _rank_methods(y_true_fit, y_pred_by_method, results)
+    baselines, architectures = _split_method_labels(method_order)
+    if max_baseline_methods is None or max_baseline_methods <= 0:
+        baselines_sel = baselines
+    else:
+        baselines_sel = baselines[: max_baseline_methods]
+    if max_ml_methods is None or max_ml_methods <= 0:
+        architectures_sel = architectures
+    else:
+        architectures_sel = architectures[: max_ml_methods]
+    selected_methods = baselines_sel + architectures_sel
+    selected_set = set(selected_methods)
+
+    if selected_methods:
+        curves_plot = _filter_curves_list(curves_list, selected_methods)
+        error_plot = _filter_error_list(error_list, selected_methods)
+        y_pred_plot = _filter_pred_by_method(y_pred_by_method, selected_methods)
+        results_plot = [row for row in results if row.get("method") in selected_set]
+    else:
+        curves_plot = list(curves_list)
+        error_plot = list(error_list)
+        y_pred_plot = dict(y_pred_by_method)
+        results_plot = list(results)
+
+    method_order_plot = _order_methods(y_pred_plot.keys(), selected_methods or method_order)
+    color_map = _build_color_map(method_order_plot)
 
     fig = plot_curves_grid(
         times,
-        curves_list,
+        curves_plot,
         n_cols=3,
         title=f"{title_prefix}: curve comparison",
         ylabel="I(t)",
+        legend=legend,
+        method_order=method_order_plot,
+        color_map=color_map,
     )
     paths["curves_comparison"] = save_figure(fig, plot_dir / "curves_comparison.png")
 
     fig = plot_curves_grid(
         times,
-        error_list,
+        error_plot,
         n_cols=3,
         title=f"{title_prefix}: absolute error curves",
         ylabel="|I_pred - I_true|",
+        legend=legend,
+        method_order=method_order_plot,
+        color_map=color_map,
     )
     paths["error_curves"] = save_figure(fig, plot_dir / "error_curves.png")
 
     fig = plot_param_scatter(
         y_true_fit,
-        y_pred_by_method,
+        y_pred_plot,
         title=f"{title_prefix}: parameter scatter",
+        method_order=method_order_plot,
+        color_map=color_map,
     )
     paths["param_scatter"] = save_figure(fig, plot_dir / "param_scatter.png")
 
     fig = plot_param_error_hist(
         y_true_fit,
-        y_pred_by_method,
+        y_pred_plot,
         title=f"{title_prefix}: parameter error distributions",
+        method_order=method_order_plot,
+        color_map=color_map,
     )
     paths["param_error_hist"] = save_figure(fig, plot_dir / "param_error_hist.png")
 
     fig = plot_metric_bars(
-        results,
+        results_plot,
         title=f"{title_prefix}: metrics by method",
+        method_order=method_order_plot,
+        color_map=color_map,
     )
     paths["metrics_comparison"] = save_figure(fig, plot_dir / "metrics_comparison.png")
 
     fig = plot_architectures_summary(
         labels_in_file=list(y_pred_by_method.keys()),
+        labels_selected=method_order_plot,
         title=f"{title_prefix}: architectures used",
     )
     paths["architectures"] = save_figure(fig, plot_dir / "architectures.png")
@@ -803,10 +1203,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=DEFAULTS.seed)
     parser.add_argument("--title", type=str, default=None)
     parser.add_argument("--prefix", type=str, default="")
-    parser.add_argument("--legend", type=str, default="first", choices=["first", "all", "none"])
+    parser.add_argument("--legend", type=str, default="global", choices=["global", "first", "all", "none"])
     parser.add_argument("--n-cols", type=int, default=3)
     parser.add_argument("--dpi", type=int, default=150)
     parser.add_argument("--include-obs", action="store_true")
+    parser.add_argument(
+        "--plot-max-ml",
+        type=int,
+        default=4,
+        help="Max ML methods to include in plots (<=0 keeps all).",
+    )
+    parser.add_argument(
+        "--plot-max-baseline",
+        type=int,
+        default=0,
+        help="Max baseline methods to include in plots (<=0 keeps all).",
+    )
     return parser.parse_args()
 
 
@@ -865,13 +1277,29 @@ def main() -> None:
     else:
         metrics_rows = _metrics_from_predictions(y_true, y_pred_by_method, meta)
 
+    method_order = _rank_methods(y_true, y_pred_by_method, metrics_rows)
+    baselines, architectures = _split_method_labels(method_order)
+    if args.plot_max_baseline and args.plot_max_baseline > 0:
+        baselines = baselines[: args.plot_max_baseline]
+    if args.plot_max_ml and args.plot_max_ml > 0:
+        architectures = architectures[: args.plot_max_ml]
+    selected_methods = baselines + architectures
+    selected_set = set(selected_methods)
+    if selected_methods:
+        y_pred_plot = _filter_pred_by_method(y_pred_by_method, selected_methods)
+        metrics_rows = [row for row in metrics_rows if row.get("method") in selected_set]
+    else:
+        y_pred_plot = dict(y_pred_by_method)
+    method_order_plot = _order_methods(y_pred_plot.keys(), selected_methods or method_order)
+    color_map = _build_color_map(method_order_plot)
+
     curve_plots = {"curves", "errors", "curve_mae_hist", "curve_quantiles"}
     if plots and curve_plots.intersection(plots):
         plot_idx = _select_indices(i_true.shape[0], args.n_curves, args.seed, args.curve_idx)
         curves_list, error_list = _build_curves(
             times,
             i_true,
-            y_pred_by_method,
+            y_pred_plot,
             plot_idx,
             meta,
             include_obs=args.include_obs,
@@ -880,6 +1308,9 @@ def main() -> None:
     else:
         curves_list = []
         error_list = []
+    if selected_methods:
+        curves_list = _filter_curves_list(curves_list, selected_methods)
+        error_list = _filter_error_list(error_list, selected_methods)
 
     if "curves" in plots:
         fig = plot_curves_grid(
@@ -889,6 +1320,8 @@ def main() -> None:
             title=f"{title_prefix}: curve comparison",
             ylabel="I(t)",
             legend=args.legend,
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}curves_comparison.png", dpi=args.dpi)
 
@@ -900,34 +1333,48 @@ def main() -> None:
             title=f"{title_prefix}: absolute error curves",
             ylabel="|I_pred - I_true|",
             legend=args.legend,
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}error_curves.png", dpi=args.dpi)
 
     if "param_scatter" in plots:
-        fig = plot_param_scatter(y_true, y_pred_by_method, title=f"{title_prefix}: parameter scatter")
+        fig = plot_param_scatter(
+            y_true,
+            y_pred_plot,
+            title=f"{title_prefix}: parameter scatter",
+            method_order=method_order_plot,
+            color_map=color_map,
+        )
         save_figure(fig, out_dir / f"{args.prefix}param_scatter.png", dpi=args.dpi)
 
     if "param_error_hist" in plots:
         fig = plot_param_error_hist(
             y_true,
-            y_pred_by_method,
+            y_pred_plot,
             title=f"{title_prefix}: parameter error distributions",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}param_error_hist.png", dpi=args.dpi)
 
     if "param_error_box" in plots:
         fig = plot_param_error_box(
             y_true,
-            y_pred_by_method,
+            y_pred_plot,
             title=f"{title_prefix}: parameter error boxplots",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}param_error_box.png", dpi=args.dpi)
 
     if "param_error_cdf" in plots:
         fig = plot_param_error_cdf(
             y_true,
-            y_pred_by_method,
+            y_pred_plot,
             title=f"{title_prefix}: parameter error CDF",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}param_error_cdf.png", dpi=args.dpi)
 
@@ -935,6 +1382,8 @@ def main() -> None:
         fig = plot_metric_bars(
             metrics_rows,
             title=f"{title_prefix}: metrics by method",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}metrics_comparison.png", dpi=args.dpi)
 
@@ -944,7 +1393,7 @@ def main() -> None:
             labels_in_file = sorted(y_pred_by_method.keys())
         fig = plot_architectures_summary(
             labels_in_file=list(labels_in_file),
-            labels_selected=list(y_pred_by_method.keys()),
+            labels_selected=method_order_plot,
             meta=meta,
             title=f"{title_prefix}: architectures used",
         )
@@ -954,6 +1403,8 @@ def main() -> None:
         fig = plot_curve_mae_hist(
             error_list,
             title=f"{title_prefix}: per-curve MAE histogram",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}curve_mae_hist.png", dpi=args.dpi)
 
@@ -962,6 +1413,8 @@ def main() -> None:
             times,
             curves_list,
             title=f"{title_prefix}: curve quantiles",
+            method_order=method_order_plot,
+            color_map=color_map,
         )
         save_figure(fig, out_dir / f"{args.prefix}curve_quantiles.png", dpi=args.dpi)
 

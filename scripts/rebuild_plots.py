@@ -3,6 +3,7 @@
 This script recreates the experiment figures without re-running the experiment.
 It expects plot data saved by --save-plot-data in runs/<run>/figures/.
 The standard set includes an `architectures.png` summary (methods used).
+Use --plot-max-ml/--plot-max-baseline to control how many methods appear in the plots.
 """
 
 from __future__ import annotations
@@ -45,6 +46,14 @@ def _parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional title prefix override for the figures.",
+    )
+    parser.add_argument("--plot-max-ml", type=int, default=4)
+    parser.add_argument("--plot-max-baseline", type=int, default=0)
+    parser.add_argument(
+        "--legend",
+        type=str,
+        default="global",
+        choices=["global", "first", "all", "none"],
     )
     parser.add_argument("--log-level", type=str, default="INFO")
     parser.add_argument("--log-file", type=str, default=None)
@@ -174,6 +183,9 @@ def main() -> None:
         y_pred_by_method,
         results,
         title_prefix=title_prefix,
+        max_ml_methods=args.plot_max_ml,
+        max_baseline_methods=args.plot_max_baseline,
+        legend=args.legend,
     )
     logger.info("Saved figures to %s", out_dir)
 

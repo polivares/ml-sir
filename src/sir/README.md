@@ -23,6 +23,9 @@ Visualización:
 - Los scripts pueden generar figuras con `--save-plots` (ver README principal).
 - Con `--save-plot-data`, los scripts también guardan `plot_data.npz` y `plot_data.json` para
   reproducir las figuras sin recalcular.
+- Por defecto, los plots incluyen todos los baselines y solo las top-k arquitecturas ML para mantener legibilidad.
+  Ajusta con `--plot-max-ml` y `--plot-max-baseline` si necesitas más/menos métodos en las figuras.
+- `--plot-legend` controla la posición de la leyenda en los grids (`global`, `first`, `all`, `none`).
 - `visualize.py` también se puede ejecutar como script para generar figuras desde `predictions.npz`
   y/o `metrics.csv` (ver docstring al inicio del archivo).
   - Incluye un plot `architectures.png` que lista qué baseline(s) y arquitecturas ML se usaron en la corrida.
@@ -540,6 +543,8 @@ print("beta,gamma:", fit_p.params, "nll:", fit_p.loss)
   - Es usado por los scripts de experimento para dejar trazabilidad de la arquitectura entrenada.
   - El diagrama usa `tf.keras.utils.plot_model` y requiere Graphviz + `pydot`
     (si no están instalados, se emite un warning y el resto se guarda igual).
+  - Si falla el render completo, intenta `architecture_simple.png` y/o guarda `architecture.dot`.
+  - Si el render falla, revisa `architecture.dot` para generar el diagrama manualmente.
 
 **Ejemplo**
 ```python

@@ -79,6 +79,8 @@ Contents:
 - `/<arch>/weights*`: TensorFlow checkpoint files for the trained model weights.
 - `/<arch>/*.weights.h5`: Keras weight file (required filename suffix in Keras 3).
 - `/<arch>/architecture.png`: diagram produced by `tf.keras.utils.plot_model`.
+- `/<arch>/architecture_simple.png`: fallback diagram with simplified settings (when full render fails).
+- `/<arch>/architecture.dot`: DOT graph fallback if Graphviz rendering fails.
 - `/<arch>/architecture.json`: model JSON config (from `model.to_json()`).
 - `/<arch>/summary.txt`: `model.summary()` captured as text.
 
@@ -204,7 +206,13 @@ Standard figure outputs (exact list may evolve):
 - `param_scatter.png`: true vs predicted scatter plots for `(beta, gamma)` per method.
 - `param_error_hist.png`: error distributions for `(beta, gamma)` per method.
 - `metrics_comparison.png`: bar charts for key metrics across methods.
-- `architectures.png`: text summary of which baseline(s) and ML architectures are present in the run artifacts.
+- `architectures.png`: text summary of which baseline(s) and ML architectures are present in the run artifacts
+  (and, if applicable, which subset was plotted).
+
+Plot readability defaults:
+- By default, plots include **all baselines** plus the **top-k ML methods** (ranked by parameter error).
+- Adjust with `--plot-max-ml` and `--plot-max-baseline` in the experiment scripts (or
+  `scripts/rebuild_plots.py`) if you want more/less methods in the figures.
 
 #### `plot_data.npz` and `plot_data.json` (only if `--save-plot-data`)
 
@@ -250,6 +258,7 @@ python scripts/rebuild_plots.py --plot-data runs/exp0_YYYYMMDD_HHMMSS/figures
 ```
 
 Outputs: saved back into that folder by default (or override with `--out-dir`).
+You can also control method density with `--plot-max-ml` / `--plot-max-baseline`.
 
 ## Practical workflow (recommended)
 

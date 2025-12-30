@@ -87,6 +87,14 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--save-plot-data", action="store_true")
     parser.add_argument("--n-plot", type=int, default=9)
     parser.add_argument("--plot-dir", type=str, default=None)
+    parser.add_argument("--plot-max-ml", type=int, default=4)
+    parser.add_argument("--plot-max-baseline", type=int, default=0)
+    parser.add_argument(
+        "--plot-legend",
+        type=str,
+        default="global",
+        choices=["global", "first", "all", "none"],
+    )
     parser.add_argument("--save-predictions", action="store_true")
     parser.add_argument("--pred-dir", type=str, default=None)
     parser.add_argument("--cache-dir", type=str, default="data/processed/sir")
@@ -659,6 +667,9 @@ def main() -> None:
                 y_pred_by_method,
                 results,
                 title_prefix="Exp2",
+                max_ml_methods=args.plot_max_ml,
+                max_baseline_methods=args.plot_max_baseline,
+                legend=args.plot_legend,
             )
 
         if args.save_plot_data:
@@ -695,6 +706,9 @@ def main() -> None:
                     "limit": args.limit,
                     "seed": args.seed,
                     "n_plot": int(args.n_plot),
+                    "plot_max_ml": int(args.plot_max_ml),
+                    "plot_max_baseline": int(args.plot_max_baseline),
+                    "plot_legend": args.plot_legend,
                 },
             )
 
@@ -743,6 +757,9 @@ def main() -> None:
             "batch_size",
             "save_plots",
             "save_plot_data",
+            "plot_max_ml",
+            "plot_max_baseline",
+            "plot_legend",
             "save_predictions",
         ],
     )

@@ -97,11 +97,18 @@ Common flags:
 - `--no-console-log`: disable console logging
 - `--save-predictions`: save per-curve `I(t)` plus `(beta,gamma)` predictions to `predictions.npz/json`
 - `--pred-dir`: override where prediction artifacts are written (default: run folder)
+- `--save-plots`: generate standard figures under `runs/<run>/figures/`
+- `--save-plot-data`: store `plot_data.npz/json` so plots can be rebuilt later
+- `--n-plot`: number of curves shown in the curve/error grids
+- `--plot-max-ml`: max ML methods included in plots (<=0 keeps all)
+- `--plot-max-baseline`: max baselines included in plots (<=0 keeps all)
+- `--plot-legend`: legend placement for curve/error grids (`global`, `first`, `all`, `none`)
 - `--exp-log`: path to the experiment log (default: `EXPERIMENTS.md`)
 - `--mark-final`: mark this run as the one used for final analysis in the experiment log
 - `--final-note`: optional note stored with the final selection
 
 Note: the classical baseline only runs when you pass `--run-baseline` (or `--run-all`).
+Note: plots include all baselines plus the top ML methods by default (see `--plot-max-ml`).
 Note: model diagrams use `tf.keras.utils.plot_model` and require `pydot` + Graphviz; if missing,
 the scripts log a warning and continue saving weights/metadata.
 
@@ -227,6 +234,7 @@ experiments:
 ```bash
 python scripts/rebuild_plots.py --plot-data runs/exp0_YYYYMMDD_HHMMSS/figures
 ```
+You can also pass `--plot-max-ml` / `--plot-max-baseline` to control how many methods appear in the figures.
 
 ## Notebooks
 

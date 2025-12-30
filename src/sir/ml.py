@@ -560,6 +560,38 @@ def _can_plot_model(tf: "object") -> bool:
     return shutil.which("dot") is not None
 
 
+def _can_model_to_dot(tf: "object") -> bool:
+    """Return True if model_to_dot can run (pydot available)."""
+    is_pydot = getattr(tf.keras.utils, "is_pydot_available", None)
+    if callable(is_pydot):
+        return bool(is_pydot())
+    try:
+        import pydot  # noqa: F401
+    except Exception:
+        return False
+    return True
+
+
+def _try_plot_model(
+    tf: "object",
+    model: "object",
+    plot_path: Path,
+    show_shapes: bool,
+    expand_nested: bool,
+    dpi: int,
+) -> bool:
+    """Attempt to render a model diagram, returning success."""
+    tf.keras.utils.plot_model(
+        model,
+        to_file=str(plot_path),
+        show_shapes=show_shapes,
+        show_layer_names=True,
+        expand_nested=expand_nested,
+        dpi=dpi,
+    )
+    return True
+
+
 def save_model_artifacts(
     model: "object",
     name: str,
@@ -580,6 +612,7 @@ def save_model_artifacts(
         "weights_file": None,
         "weights_files": [],
         "architecture_plot": None,
+        "architecture_dot": None,
         "architecture_json": None,
         "summary_txt": None,
     }
@@ -614,22 +647,37 @@ def save_model_artifacts(
     if _can_plot_model(tf):
         try:
             plot_path = model_dir / "architecture.png"
-            tf.keras.utils.plot_model(
-                model,
-                to_file=str(plot_path),
-                show_shapes=True,
-                show_layer_names=True,
-                expand_nested=True,
-                dpi=150,
-            )
+            _try_plot_model(tf, model, plot_path, show_shapes=True, expand_nested=True, dpi=150)
             artifacts["architecture_plot"] = plot_path
         except Exception as exc:
             logger.warning("Failed to plot model for %s: %s", name, exc)
+            try:
+                plot_path = model_dir / "architecture_simple.png"
+                _try_plot_model(tf, model, plot_path, show_shapes=False, expand_nested=False, dpi=96)
+                artifacts["architecture_plot"] = plot_path
+                logger.info("Saved simplified diagram for %s to %s", name, plot_path)
+            except Exception as exc2:
+                logger.warning("Failed to plot simplified model for %s: %s", name, exc2)
     else:
         logger.warning(
             "Skipping plot_model for %s (Graphviz + pydot not available)",
             name,
         )
+
+    if artifacts["architecture_plot"] is None and _can_model_to_dot(tf):
+        try:
+            dot_path = model_dir / "architecture.dot"
+            dot = tf.keras.utils.model_to_dot(
+                model,
+                show_shapes=False,
+                show_layer_names=True,
+                expand_nested=False,
+            )
+            dot_path.write_text(dot.to_string(), encoding="utf-8")
+            artifacts["architecture_dot"] = dot_path
+            logger.info("Saved DOT diagram for %s to %s", name, dot_path)
+        except Exception as exc:
+            logger.warning("Failed to write architecture.dot for %s: %s", name, exc)
 
     logger.info("Saved model artifacts for %s to %s", name, model_dir)
     return artifacts
