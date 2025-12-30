@@ -2,6 +2,7 @@
 
 This script recreates the experiment figures without re-running the experiment.
 It expects plot data saved by --save-plot-data in runs/<run>/figures/.
+The standard set includes an `architectures.png` summary (methods used).
 """
 
 from __future__ import annotations

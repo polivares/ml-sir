@@ -18,6 +18,7 @@ import argparse
 import csv
 import json
 from pathlib import Path
+import textwrap
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
@@ -457,6 +458,94 @@ def plot_metric_bars(
     return fig
 
 
+def _split_method_labels(labels: Sequence[str]) -> Tuple[List[str], List[str]]:
+    """Split method labels into baselines and ML architectures by convention."""
+    baselines: List[str] = []
+    architectures: List[str] = []
+    for label in labels:
+        label = str(label)
+        if label.startswith("baseline_"):
+            baselines.append(label)
+        else:
+            architectures.append(label)
+    return baselines, architectures
+
+
+def plot_architectures_summary(
+    labels_in_file: Sequence[str],
+    title: str,
+    meta: Optional[Mapping[str, object]] = None,
+    labels_selected: Optional[Sequence[str]] = None,
+    figsize: Tuple[float, float] = (8.5, 5.5),
+) -> plt.Figure:
+    """Render a text-only figure listing which methods/architectures were used."""
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    ax.axis("off")
+
+    labels_in_file = [str(x) for x in labels_in_file]
+    labels_selected = [str(x) for x in labels_selected] if labels_selected else []
+
+    baselines, architectures = _split_method_labels(labels_in_file)
+
+    lines: List[str] = [title, ""]
+
+    if meta:
+        context_keys = [
+            "exp",
+            "scenario",
+            "noise",
+            "train_mode",
+            "rho",
+            "k",
+            "estimate_rho",
+            "window_days",
+            "downsample",
+            "normalize",
+            "run_baseline",
+            "seed",
+            "n_starts",
+            "max_test",
+            "test_size",
+            "limit",
+        ]
+        ctx: List[str] = []
+        for key in context_keys:
+            if key in meta and meta.get(key) is not None:
+                ctx.append(f"{key}={meta.get(key)}")
+        if ctx:
+            lines.append("Context:")
+            lines.extend(textwrap.wrap(", ".join(ctx), width=95))
+            lines.append("")
+
+    lines.append("Baselines:")
+    lines.append(f"- {', '.join(baselines) if baselines else '(none)'}")
+    lines.append("")
+    lines.append(f"ML architectures ({len(architectures)}):")
+    if architectures:
+        for label in architectures:
+            lines.append(f"- {label}")
+    else:
+        lines.append("- (none)")
+
+    if labels_selected and set(labels_selected) != set(labels_in_file):
+        lines.append("")
+        lines.append("Selected subset (--methods):")
+        lines.extend(textwrap.wrap(", ".join(sorted(labels_selected)), width=95))
+
+    ax.text(
+        0.0,
+        1.0,
+        "\n".join(lines),
+        va="top",
+        ha="left",
+        fontsize=10,
+        family="monospace",
+        transform=ax.transAxes,
+    )
+
+    return fig
+
+
 def save_experiment_figures(
     plot_dir: Path | str,
     times: np.ndarray,
@@ -510,6 +599,12 @@ def save_experiment_figures(
         title=f"{title_prefix}: metrics by method",
     )
     paths["metrics_comparison"] = save_figure(fig, plot_dir / "metrics_comparison.png")
+
+    fig = plot_architectures_summary(
+        labels_in_file=list(y_pred_by_method.keys()),
+        title=f"{title_prefix}: architectures used",
+    )
+    paths["architectures"] = save_figure(fig, plot_dir / "architectures.png")
 
     return paths
 
@@ -752,6 +847,7 @@ def main() -> None:
         plots = [
             "curves",
             "errors",
+            "architectures",
             "param_scatter",
             "param_error_hist",
             "param_error_box",
@@ -841,6 +937,18 @@ def main() -> None:
             title=f"{title_prefix}: metrics by method",
         )
         save_figure(fig, out_dir / f"{args.prefix}metrics_comparison.png", dpi=args.dpi)
+
+    if "architectures" in plots:
+        labels_in_file = meta.get("y_pred_labels")
+        if labels_in_file is None:
+            labels_in_file = sorted(y_pred_by_method.keys())
+        fig = plot_architectures_summary(
+            labels_in_file=list(labels_in_file),
+            labels_selected=list(y_pred_by_method.keys()),
+            meta=meta,
+            title=f"{title_prefix}: architectures used",
+        )
+        save_figure(fig, out_dir / f"{args.prefix}architectures.png", dpi=args.dpi)
 
     if "curve_mae_hist" in plots:
         fig = plot_curve_mae_hist(

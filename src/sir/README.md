@@ -25,6 +25,9 @@ Visualización:
   reproducir las figuras sin recalcular.
 - `visualize.py` también se puede ejecutar como script para generar figuras desde `predictions.npz`
   y/o `metrics.csv` (ver docstring al inicio del archivo).
+  - Incluye un plot `architectures.png` que lista qué baseline(s) y arquitecturas ML se usaron en la corrida.
+  - También puedes generarlo manualmente con:
+    `python -m src.visualization.visualize --predictions runs/<run>/predictions.npz --plots architectures`
 
 ---
 
@@ -414,13 +417,18 @@ print("beta,gamma:", fit_p.params, "nll:", fit_p.loss)
 ## `ml.py` — modelos ML/DL (TensorFlow/Keras)
 
 **Objetivo**
-- Definir arquitecturas estándar (MLP y CNN1D) para mapear `I(t) -> (beta, gamma)`.
+- Definir arquitecturas estándar (MLP/CNN/RNN/Transformer) para mapear `I(t) -> (beta, gamma)`.
+- Incluir variantes distribucionales (heteroscedástico, MDN) cuando se necesita incertidumbre.
 - Proveer entrenamiento con early stopping y medición de tiempo de entrenamiento/inferencia.
 
 **Dependencia**
 - Requiere `tensorflow` instalado. Si no lo está, `_require_tf()` lanza `RuntimeError`.
 
 ### Modelos
+
+- `build_linear(input_dim=1001) -> keras.Model`
+  - Regresión lineal (Dense(2)) con L2 opcional.
+  - Útil como baseline ML muy simple.
 
 - `build_mlp(input_dim=1001) -> keras.Model`
   - MLP secuencial con capas densas y activación `swish`.
@@ -431,8 +439,40 @@ print("beta,gamma:", fit_p.params, "nll:", fit_p.loss)
   - Tronco compartido + 2 cabezas (beta y gamma) concatenadas.
   - Mismo loss/métricas para comparabilidad.
 
+- `build_resmlp(input_dim=1001, width=128, depth=4, dropout=0.1) -> keras.Model`
+  - MLP con bloques residuales + LayerNorm.
+
 - `build_cnn1d(input_len=1001) -> keras.Model`
   - CNN liviana: reshape a `(T, 1)` + Conv1D + GAP + dense.
+
+- `build_tcn(input_len=1001, ...) -> keras.Model`
+  - TCN con Conv1D dilatadas y residuales.
+
+- `build_inception(input_len=1001, ...) -> keras.Model`
+  - CNN estilo Inception (múltiples kernels por bloque).
+
+- `build_attn_cnn(input_len=1001, ...) -> keras.Model`
+  - CNN con pooling por atención.
+
+- `build_gru(input_len=1001, ...) -> keras.Model`
+  - Encoder GRU (opcional bidireccional).
+
+- `build_lstm(input_len=1001, ...) -> keras.Model`
+  - Encoder LSTM (opcional bidireccional).
+
+- `build_conv_gru(input_len=1001, ...) -> keras.Model`
+  - Downsampling Conv1D + GRU.
+
+- `build_transformer(input_len=1001, ...) -> keras.Model`
+  - Encoder Transformer pequeño con pooling global.
+
+- `build_mlp_heteroscedastic(input_dim=1001, ...) -> keras.Model`
+  - Predice media + log-varianza por parámetro.
+  - Loss: NLL gaussiana (heteroscedástico).
+
+- `build_mlp_mdn(input_dim=1001, n_components=3, ...) -> keras.Model`
+  - MDN (mezcla Gaussiana) sobre `(beta, gamma)`.
+  - Loss: NLL de mezcla.
 
 ### Entrenamiento y timing
 
@@ -444,11 +484,24 @@ print("beta,gamma:", fit_p.params, "nll:", fit_p.loss)
     - `history`: objeto Keras History
     - `eval_metrics`: dict con métricas en validation (según `model.metrics_names`)
     - `train_time_sec`: tiempo total de entrenamiento (segundos)
-  - Usa `EarlyStopping(monitor="val_r2_score", restore_best_weights=True)`.
+  - Usa `EarlyStopping` con `monitor=model.sir_monitor` si existe; si no, usa `val_r2_score`.
+    - Los modelos heteroscedásticos/MDN fijan `sir_monitor="val_loss"` por defecto.
 
 - `predict_time_per_sample(model, X, n_samples=100) -> np.ndarray`
   - **Entrada**: `X` shape `(n_samples_total, T)`
   - **Salida**: array de tiempos por predicción (segundos), estimado muestreando predicciones de a 1.
+
+- `predict_params(model, X) -> np.ndarray`
+  - Devuelve `(beta, gamma)` incluso si el modelo tiene cabeza distribucional:
+    - heteroscedástico: retorna la media (primeras 2 columnas).
+    - MDN: retorna la media ponderada por las mezclas.
+
+- `save_model_artifacts(model, name, out_dir) -> dict`
+  - Guarda **pesos** (checkpoints TF), **diagrama** (`architecture.png`), `architecture.json`
+    y `summary.txt` en `out_dir/<name>/`.
+  - Es usado por los scripts de experimento para dejar trazabilidad de la arquitectura entrenada.
+  - El diagrama usa `tf.keras.utils.plot_model` y requiere Graphviz + `pydot`
+    (si no están instalados, se emite un warning y el resto se guarda igual).
 
 **Ejemplo**
 ```python

@@ -14,7 +14,8 @@ given **I(t)**, predict **(beta, gamma)**.
   - Per-curve optimization on clean data (MSE + L-BFGS-B, multi-start).
   - Per-curve maximum likelihood under observation noise (Poisson / NegBin, multi-start).
 - **ML/DL baselines**:
-  - MLP, branched-MLP, CNN1D (TensorFlow/Keras).
+  - MLP, branched-MLP, CNN1D, linear, ResMLP, TCN, Inception-style CNN,
+    attention CNN, GRU/LSTM, Conv-GRU, Transformer, heteroscedastic and MDN heads.
 - **Realistic observation mechanisms** (incremental): Poisson, Negative Binomial, windows, downsampling.
 
 ## Repository Structure (relevant)
@@ -68,7 +69,9 @@ All scripts write a run folder under `runs/` containing:
 - `config.json` (CLI args + timestamp)
 - `metrics.csv` (one row per method evaluated)
 - `run.log` (console + file logs for traceability)
+- `models/` (one subfolder per ML architecture, weights + `architecture.png` + manifest)
 - `figures/` (if `--save-plots` is enabled)
+  - includes standard plots plus `architectures.png` (methods/architectures used)
 
 Each experiment run also appends an entry to `EXPERIMENTS.md`, which tracks:
 - the **last run per experiment**, and
@@ -77,8 +80,12 @@ Each experiment run also appends an entry to `EXPERIMENTS.md`, which tracks:
 Common flags:
 - `--seed`: reproducibility
 - `--limit`: subsample the dataset (useful for quick runs)
-- `--max-test`: cap number of test curves for classical fitting (runtime control)
+- `--max-test`: cap number of test curves for classical fitting (runtime control; only if `--run-baseline`)
 - `--normalize {max,population}`: consistent scaling for ML models
+- `--run-all`: run every ML architecture available in the experiment
+- `--run-baseline`: run the classical baseline for the experiment
+- `--run-*`: enable ML architectures (`mlp`, `mlp_branched`, `cnn1d`, `linear`, `resmlp`,
+  `tcn`, `inception`, `attn_cnn`, `gru`, `lstm`, `conv_gru`, `transformer`, `mlp_hetero`, `mlp_mdn`)
 - `--cache-dir` / `--no-cache`: caching for derived arrays/splits (default `data/processed/sir`)
 - `--progress-every`: how often to log baseline progress (Exp0/Exp1/Exp2)
 - `--log-level`: logging verbosity (`INFO` by default)
@@ -91,28 +98,32 @@ Common flags:
 - `--mark-final`: mark this run as the one used for final analysis in the experiment log
 - `--final-note`: optional note stored with the final selection
 
+Note: the classical baseline only runs when you pass `--run-baseline` (or `--run-all`).
+Note: model diagrams use `tf.keras.utils.plot_model` and require `pydot` + Graphviz; if missing,
+the scripts log a warning and continue saving weights/metadata.
+
 ### Exp0: Clean-data benchmark
 
 File: `scripts/exp0_run.py`
 
 What it does:
 - Builds a train/val/test split from clean I(t).
-- Fits the classical baseline (`baseline_mse`) per curve (multi-start L-BFGS-B).
+- Fits the classical baseline (`baseline_mse`) per curve **when `--run-baseline` (or `--run-all`) is set**.
 - Optionally trains ML models and evaluates on the full test set.
 
 Run:
 ```bash
-python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-mlp --normalize max
+python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-baseline --run-mlp --normalize max
 ```
 
 Optional plots (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-mlp --normalize max --save-plots --n-plot 9
+python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-baseline --run-mlp --normalize max --save-plots --n-plot 9
 ```
 
 Optional plot data (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-mlp --normalize max --save-plot-data --n-plot 9
+python scripts/exp0_run.py --limit 5000 --max-test 200 --n-starts 5 --run-baseline --run-mlp --normalize max --save-plot-data --n-plot 9
 ```
 
 ### Exp1: Observation-noise benchmark (Poisson / NegBin)
@@ -121,7 +132,7 @@ File: `scripts/exp1_noise.py`
 
 What it does:
 - Adds Poisson or Negative Binomial noise to I(t) (treated as observed counts).
-- Fits the corresponding classical MLE baseline per curve.
+- Fits the corresponding classical MLE baseline per curve **when `--run-baseline` (or `--run-all`) is set**.
 - Optionally trains ML models under different training modes:
   - `clean`: train on clean I(t), test on noisy observations
   - `noisy`: train/test with the same noise parameters
@@ -129,18 +140,18 @@ What it does:
 
 Run examples:
 ```bash
-python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-mlp --normalize max
-python scripts/exp1_noise.py --noise negbin --train-mode mixed --rho 0.5 --k 10 --run-cnn1d --normalize max
+python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-baseline --run-mlp --normalize max
+python scripts/exp1_noise.py --noise negbin --train-mode mixed --rho 0.5 --k 10 --run-baseline --run-cnn1d --normalize max
 ```
 
 Optional plots (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-mlp --normalize max --save-plots --n-plot 9
+python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-baseline --run-mlp --normalize max --save-plots --n-plot 9
 ```
 
 Optional plot data (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-mlp --normalize max --save-plot-data --n-plot 9
+python scripts/exp1_noise.py --noise poisson --train-mode clean --rho 0.5 --run-baseline --run-mlp --normalize max --save-plot-data --n-plot 9
 ```
 
 ### Exp2: Windowing + downsampling benchmark
@@ -149,21 +160,22 @@ File: `scripts/exp2_window_downsample.py`
 
 What it does:
 - Applies early window truncation and/or temporal downsampling to I(t) before fitting.
-- Adjusts the classical baseline grid to the effective dt and horizon induced by downsampling.
+- Adjusts the classical baseline grid to the effective dt and horizon induced by downsampling
+  **when `--run-baseline` (or `--run-all`) is set**.
 
 Run:
 ```bash
-python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-mlp --normalize max
+python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-baseline --run-mlp --normalize max
 ```
 
 Optional plots (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-mlp --normalize max --save-plots --n-plot 9
+python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-baseline --run-mlp --normalize max --save-plots --n-plot 9
 ```
 
 Optional plot data (saved under `runs/<run>/figures/`):
 ```bash
-python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-mlp --normalize max --save-plot-data --n-plot 9
+python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 --run-baseline --run-mlp --normalize max --save-plot-data --n-plot 9
 ```
 
 ### Aggregation

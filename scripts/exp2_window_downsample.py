@@ -1,7 +1,8 @@
 """Exp2 benchmark for partial windows and downsampling.
 
 Applies early-window truncation and/or temporal downsampling to I(t) before
-fitting, to mimic partial observation windows and lower reporting frequency.
+fitting, to mimic partial observation windows and lower reporting frequency,
+with optional ML baselines.
 The classical fit is adjusted for the effective dt and t1.
 Writes a run folder with config.json and metrics.csv under runs/.
 Typical usage:
@@ -51,9 +52,22 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--downsample", type=int, default=1)
     parser.add_argument("--n-starts", type=int, default=5)
     parser.add_argument("--max-test", type=int, default=None)
+    parser.add_argument("--run-baseline", action="store_true")
     parser.add_argument("--run-mlp", action="store_true")
     parser.add_argument("--run-mlp-branched", action="store_true")
     parser.add_argument("--run-cnn1d", action="store_true")
+    parser.add_argument("--run-linear", action="store_true")
+    parser.add_argument("--run-resmlp", action="store_true")
+    parser.add_argument("--run-tcn", action="store_true")
+    parser.add_argument("--run-inception", action="store_true")
+    parser.add_argument("--run-attn-cnn", action="store_true")
+    parser.add_argument("--run-gru", action="store_true")
+    parser.add_argument("--run-lstm", action="store_true")
+    parser.add_argument("--run-conv-gru", action="store_true")
+    parser.add_argument("--run-transformer", action="store_true")
+    parser.add_argument("--run-mlp-hetero", action="store_true")
+    parser.add_argument("--run-mlp-mdn", action="store_true")
+    parser.add_argument("--run-all", action="store_true")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--patience", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=32)
@@ -100,6 +114,21 @@ def _choose_plot_indices(pool: np.ndarray, n_plot: int, rng: np.random.Generator
     return np.sort(rng.choice(pool, size=n_plot, replace=False))
 
 
+def _relativize_paths(payload: dict[str, object], root: Path) -> dict[str, object]:
+    """Convert Path objects in a dict to root-relative strings."""
+    def _convert(value: object) -> object:
+        if isinstance(value, Path):
+            try:
+                return str(value.relative_to(root))
+            except ValueError:
+                return str(value)
+        if isinstance(value, list):
+            return [_convert(item) for item in value]
+        return value
+
+    return {key: _convert(val) for key, val in payload.items()}
+
+
 def _apply_transforms(
     X: np.ndarray, window_days: Optional[float], downsample: int
 ) -> np.ndarray:
@@ -114,11 +143,37 @@ def _apply_transforms(
     return out
 
 
+def _apply_run_all(args: argparse.Namespace) -> None:
+    """Enable every ML architecture flag when --run-all is set."""
+    if not args.run_all:
+        return
+    args.run_baseline = True
+    for flag in (
+        "run_linear",
+        "run_mlp",
+        "run_mlp_branched",
+        "run_resmlp",
+        "run_cnn1d",
+        "run_tcn",
+        "run_inception",
+        "run_attn_cnn",
+        "run_gru",
+        "run_lstm",
+        "run_conv_gru",
+        "run_transformer",
+        "run_mlp_hetero",
+        "run_mlp_mdn",
+    ):
+        setattr(args, flag, True)
+
+
 def main() -> None:
     args = _parse_args()
+    _apply_run_all(args)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir = Path(args.out_dir) if args.out_dir else DEFAULTS.runs_dir / f"exp2_{timestamp}"
     ensure_dir(out_dir)
+    models_dir = out_dir / "models"
 
     log_file = None
     if not args.no_log_file:
@@ -225,146 +280,155 @@ def main() -> None:
     logger.info("Effective grid: dt=%.4f t1=%.2f", dt_eff, t1_eff)
 
     results = []
+    scenario = "window_downsample"
+    baseline_method = "baseline_mse"
+    baseline_pred: dict[int, np.ndarray] = {}
+    model_artifacts: list[dict[str, object]] = []
+    idx_fit = np.array([], dtype=int)
+    y_pred = y_test[:0]
+    y_test_fit = y_test[:0]
 
-    # Baseline MSE fit per curve (multi-start).
-    X_test_fit, idx_fit = _subset(X_test, args.max_test, rng)
-    y_test_fit = y_test[idx_fit]
-    logger.info("Baseline MSE fitting on %d curves", X_test_fit.shape[0])
-    y_pred = []
-    fit_times = []
-    start = time.perf_counter()
-    for i in range(X_test_fit.shape[0]):
-        local_rng = np.random.default_rng(args.seed + i)
-        fit = fit_mse(
-            X_test_fit[i],
-            n_starts=args.n_starts,
-            rng=local_rng,
-            t1=t1_eff,
-            dt=dt_eff,
-        )
-        y_pred.append(fit.params[:2])
-        fit_times.append(sum(fit.times))
-        if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
-            elapsed = time.perf_counter() - start
-            avg = elapsed / (i + 1)
-            logger.info(
-                "Baseline progress: %d/%d curves (avg %.3fs/curve)",
-                i + 1,
-                X_test_fit.shape[0],
-                avg,
+    if args.run_baseline:
+        # Baseline MSE fit per curve (multi-start).
+        X_test_fit, idx_fit = _subset(X_test, args.max_test, rng)
+        y_test_fit = y_test[idx_fit]
+        logger.info("Baseline MSE fitting on %d curves", X_test_fit.shape[0])
+        y_pred_list = []
+        fit_times = []
+        start = time.perf_counter()
+        for i in range(X_test_fit.shape[0]):
+            local_rng = np.random.default_rng(args.seed + i)
+            fit = fit_mse(
+                X_test_fit[i],
+                n_starts=args.n_starts,
+                rng=local_rng,
+                t1=t1_eff,
+                dt=dt_eff,
             )
+            y_pred_list.append(fit.params[:2])
+            fit_times.append(sum(fit.times))
+            if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
+                elapsed = time.perf_counter() - start
+                avg = elapsed / (i + 1)
+                logger.info(
+                    "Baseline progress: %d/%d curves (avg %.3fs/curve)",
+                    i + 1,
+                    X_test_fit.shape[0],
+                    avg,
+                )
 
-    y_pred = np.asarray(y_pred)
-    baseline_pred = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
-    metrics = per_param_metrics(y_test_fit, y_pred)
-    metrics.update(timing_summary(np.asarray(fit_times)))
-    metrics.update({
-        "method": "baseline_mse",
-        "scenario": "window_downsample",
-        "n_test": int(X_test_fit.shape[0]),
-        "window_days": args.window_days,
-        "downsample": args.downsample,
-    })
-    results.append(metrics)
+        y_pred = np.asarray(y_pred_list)
+        baseline_pred = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
+        metrics = per_param_metrics(y_test_fit, y_pred)
+        metrics.update(timing_summary(np.asarray(fit_times)))
+        metrics.update({
+            "method": baseline_method,
+            "scenario": scenario,
+            "n_test": int(X_test_fit.shape[0]),
+            "window_days": args.window_days,
+            "downsample": args.downsample,
+        })
+        results.append(metrics)
+    else:
+        logger.info("Skipping baseline fit (no --run-baseline flag)")
 
-    y_pred_mlp = None
-    y_pred_mlp_branched = None
-    y_pred_cnn1d = None
+    y_pred_ml: dict[str, np.ndarray] = {}
+    ml_flags = [
+        args.run_linear,
+        args.run_mlp,
+        args.run_mlp_branched,
+        args.run_resmlp,
+        args.run_cnn1d,
+        args.run_tcn,
+        args.run_inception,
+        args.run_attn_cnn,
+        args.run_gru,
+        args.run_lstm,
+        args.run_conv_gru,
+        args.run_transformer,
+        args.run_mlp_hetero,
+        args.run_mlp_mdn,
+    ]
 
     # ML models (optional)
-    if args.run_mlp or args.run_mlp_branched or args.run_cnn1d:
+    if any(ml_flags):
         # Normalize with the same strategy across train/val/test.
         logger.info("Preparing normalized inputs for ML (method=%s)", args.normalize)
         X_train_in = normalize_series(X_train, method=args.normalize, population=pop_train)
         X_val_in = normalize_series(X_val, method=args.normalize, population=pop_val)
         X_test_in = normalize_series(X_test, method=args.normalize, population=pop_test)
+
+        input_dim = X_train_in.shape[1]
+        model_specs = [
+            ("linear", args.run_linear, lambda: ml.build_linear(input_dim=input_dim)),
+            ("mlp", args.run_mlp, lambda: ml.build_mlp(input_dim=input_dim)),
+            ("mlp_branched", args.run_mlp_branched, lambda: ml.build_mlp_branched(input_dim=input_dim)),
+            ("resmlp", args.run_resmlp, lambda: ml.build_resmlp(input_dim=input_dim)),
+            ("cnn1d", args.run_cnn1d, lambda: ml.build_cnn1d(input_len=input_dim)),
+            ("tcn", args.run_tcn, lambda: ml.build_tcn(input_len=input_dim)),
+            ("inception", args.run_inception, lambda: ml.build_inception(input_len=input_dim)),
+            ("attn_cnn", args.run_attn_cnn, lambda: ml.build_attn_cnn(input_len=input_dim)),
+            ("gru", args.run_gru, lambda: ml.build_gru(input_len=input_dim)),
+            ("lstm", args.run_lstm, lambda: ml.build_lstm(input_len=input_dim)),
+            ("conv_gru", args.run_conv_gru, lambda: ml.build_conv_gru(input_len=input_dim)),
+            ("transformer", args.run_transformer, lambda: ml.build_transformer(input_len=input_dim)),
+            ("mlp_hetero", args.run_mlp_hetero, lambda: ml.build_mlp_heteroscedastic(input_dim=input_dim)),
+            ("mlp_mdn", args.run_mlp_mdn, lambda: ml.build_mlp_mdn(input_dim=input_dim)),
+        ]
+
+        for name, enabled, builder in model_specs:
+            if not enabled:
+                continue
+            logger.info("Training %s", name)
+            model = builder()
+            train_res = ml.train_model(
+                model,
+                X_train_in,
+                y_train,
+                X_val_in,
+                y_val,
+                epochs=args.epochs,
+                patience=args.patience,
+                batch_size=args.batch_size,
+            )
+            logger.info("%s training done (train_time_sec=%.2f)", name, train_res.train_time_sec)
+            y_pred = ml.predict_params(model, X_test_in)
+            y_pred_ml[name] = y_pred
+            metrics = per_param_metrics(y_test, y_pred)
+            metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
+            metrics.update({
+                "method": name,
+                "scenario": scenario,
+                "n_test": int(X_test_in.shape[0]),
+                "train_time_sec": float(train_res.train_time_sec),
+                "window_days": args.window_days,
+                "downsample": args.downsample,
+            })
+            results.append(metrics)
+            artifact = ml.save_model_artifacts(model, name, models_dir)
+            model_artifacts.append(_relativize_paths(artifact, out_dir))
     else:
         logger.info("Skipping ML models (no --run-* flags)")
 
-    if args.run_mlp:
-        logger.info("Training MLP")
-        model = ml.build_mlp(input_dim=X_train_in.shape[1])
-        train_res = ml.train_model(
-            model,
-            X_train_in,
-            y_train,
-            X_val_in,
-            y_val,
-            epochs=args.epochs,
-            patience=args.patience,
-            batch_size=args.batch_size,
-        )
-        logger.info("MLP training done (train_time_sec=%.2f)", train_res.train_time_sec)
-        y_pred_mlp = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred_mlp)
-        metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
-        metrics.update({
-            "method": "mlp",
-            "scenario": "window_downsample",
-            "n_test": int(X_test_in.shape[0]),
-            "train_time_sec": float(train_res.train_time_sec),
-            "window_days": args.window_days,
-            "downsample": args.downsample,
-        })
-        results.append(metrics)
-
-    if args.run_mlp_branched:
-        logger.info("Training branched MLP")
-        model = ml.build_mlp_branched(input_dim=X_train_in.shape[1])
-        train_res = ml.train_model(
-            model,
-            X_train_in,
-            y_train,
-            X_val_in,
-            y_val,
-            epochs=args.epochs,
-            patience=args.patience,
-            batch_size=args.batch_size,
-        )
-        logger.info("Branched MLP training done (train_time_sec=%.2f)", train_res.train_time_sec)
-        y_pred_mlp_branched = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred_mlp_branched)
-        metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
-        metrics.update({
-            "method": "mlp_branched",
-            "scenario": "window_downsample",
-            "n_test": int(X_test_in.shape[0]),
-            "train_time_sec": float(train_res.train_time_sec),
-            "window_days": args.window_days,
-            "downsample": args.downsample,
-        })
-        results.append(metrics)
-
-    if args.run_cnn1d:
-        logger.info("Training CNN1D")
-        model = ml.build_cnn1d(input_len=X_train_in.shape[1])
-        train_res = ml.train_model(
-            model,
-            X_train_in,
-            y_train,
-            X_val_in,
-            y_val,
-            epochs=args.epochs,
-            patience=args.patience,
-            batch_size=args.batch_size,
-        )
-        logger.info("CNN1D training done (train_time_sec=%.2f)", train_res.train_time_sec)
-        y_pred_cnn1d = model.predict(X_test_in, verbose=0)
-        metrics = per_param_metrics(y_test, y_pred_cnn1d)
-        metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
-        metrics.update({
-            "method": "cnn1d",
-            "scenario": "window_downsample",
-            "n_test": int(X_test_in.shape[0]),
-            "train_time_sec": float(train_res.train_time_sec),
-            "window_days": args.window_days,
-            "downsample": args.downsample,
-        })
-        results.append(metrics)
+    baseline_methods = [baseline_method] if args.run_baseline else []
+    ensure_dir(models_dir)
+    save_json(
+        models_dir / "manifest.json",
+        {
+            "exp": "exp2",
+            "baseline_methods": baseline_methods,
+            "ml_architectures": sorted(y_pred_ml.keys()),
+            "models": model_artifacts,
+        },
+    )
 
     # Persist run configuration and metrics for aggregation.
     config = vars(args)
     config.update({"timestamp": timestamp})
+    config.update({
+        "baseline_methods": baseline_methods,
+        "ml_architectures": sorted(y_pred_ml.keys()),
+    })
     save_json(out_dir / "config.json", config)
     save_csv(out_dir / "metrics.csv", results)
     logger.info("Saved metrics to %s", out_dir / "metrics.csv")
@@ -375,16 +439,12 @@ def main() -> None:
         times = DEFAULTS.t0 + np.arange(X_test.shape[1]) * dt_eff
         y_pred_by_method = {}
 
-        baseline_full = np.full_like(y_test, np.nan, dtype=float)
-        if idx_fit.size > 0:
-            baseline_full[idx_fit] = y_pred
-        y_pred_by_method["baseline_mse"] = baseline_full
-        if y_pred_mlp is not None:
-            y_pred_by_method["mlp"] = y_pred_mlp
-        if y_pred_mlp_branched is not None:
-            y_pred_by_method["mlp_branched"] = y_pred_mlp_branched
-        if y_pred_cnn1d is not None:
-            y_pred_by_method["cnn1d"] = y_pred_cnn1d
+        if args.run_baseline:
+            baseline_full = np.full_like(y_test, np.nan, dtype=float)
+            if idx_fit.size > 0:
+                baseline_full[idx_fit] = y_pred
+            y_pred_by_method[baseline_method] = baseline_full
+        y_pred_by_method.update(y_pred_ml)
 
         save_predictions(
             pred_dir,
@@ -393,11 +453,22 @@ def main() -> None:
             y_true=y_test,
             y_pred_by_method=y_pred_by_method,
             idx_test=splits["idx_test"],
-            idx_fit=idx_fit,
+            idx_fit=idx_fit if args.run_baseline else None,
             metadata={
                 "exp": "exp2",
+                "scenario": scenario,
                 "window_days": args.window_days,
                 "downsample": int(args.downsample),
+                "baseline_method": baseline_method if args.run_baseline else None,
+                "ml_architectures": sorted(y_pred_ml.keys()),
+                "run_all": bool(args.run_all),
+                "run_baseline": bool(args.run_baseline),
+                "normalize": args.normalize,
+                "n_starts": int(args.n_starts),
+                "max_test": args.max_test,
+                "test_size": float(args.test_size),
+                "val_size": float(args.val_size),
+                "limit": args.limit,
                 "seed": args.seed,
                 "s0": DEFAULTS.s0,
                 "i0": DEFAULTS.i0,
@@ -440,10 +511,10 @@ def main() -> None:
                     dt=dt_eff,
                 )
                 curves["I_pred_baseline"] = I_pred
-                errors["baseline_mse"] = np.abs(I_pred - X_test[idx])
+                errors[baseline_method] = np.abs(I_pred - X_test[idx])
 
-            if y_pred_mlp is not None:
-                params = y_pred_mlp[idx]
+            for method_name, y_pred_full in y_pred_ml.items():
+                params = y_pred_full[idx]
                 I_pred = simulate_sir(
                     params[0],
                     params[1],
@@ -454,50 +525,21 @@ def main() -> None:
                     t1=t1_eff,
                     dt=dt_eff,
                 )
-                curves["I_pred_mlp"] = I_pred
-                errors["mlp"] = np.abs(I_pred - X_test[idx])
-
-            if y_pred_mlp_branched is not None:
-                params = y_pred_mlp_branched[idx]
-                I_pred = simulate_sir(
-                    params[0],
-                    params[1],
-                    s0=DEFAULTS.s0,
-                    i0=DEFAULTS.i0,
-                    r0=DEFAULTS.r0,
-                    t0=DEFAULTS.t0,
-                    t1=t1_eff,
-                    dt=dt_eff,
-                )
-                curves["I_pred_mlp_branched"] = I_pred
-                errors["mlp_branched"] = np.abs(I_pred - X_test[idx])
-
-            if y_pred_cnn1d is not None:
-                params = y_pred_cnn1d[idx]
-                I_pred = simulate_sir(
-                    params[0],
-                    params[1],
-                    s0=DEFAULTS.s0,
-                    i0=DEFAULTS.i0,
-                    r0=DEFAULTS.r0,
-                    t0=DEFAULTS.t0,
-                    t1=t1_eff,
-                    dt=dt_eff,
-                )
-                curves["I_pred_cnn1d"] = I_pred
-                errors["cnn1d"] = np.abs(I_pred - X_test[idx])
+                curves[f"I_pred_{method_name}"] = I_pred
+                errors[method_name] = np.abs(I_pred - X_test[idx])
 
             curves_list.append(curves)
             error_list.append(errors)
 
-        y_true_plot = y_test_fit
-        y_pred_by_method = {"baseline_mse": y_pred}
-        if y_pred_mlp is not None:
-            y_pred_by_method["mlp"] = y_pred_mlp[idx_fit]
-        if y_pred_mlp_branched is not None:
-            y_pred_by_method["mlp_branched"] = y_pred_mlp_branched[idx_fit]
-        if y_pred_cnn1d is not None:
-            y_pred_by_method["cnn1d"] = y_pred_cnn1d[idx_fit]
+        use_fit_subset = args.run_baseline and idx_fit.size > 0
+        if use_fit_subset:
+            y_true_plot = y_test_fit
+            y_pred_by_method = {baseline_method: y_pred} if args.run_baseline else {}
+            for method_name, y_pred_full in y_pred_ml.items():
+                y_pred_by_method[method_name] = y_pred_full[idx_fit]
+        else:
+            y_true_plot = y_test
+            y_pred_by_method = dict(y_pred_ml)
 
         if args.save_plots:
             viz.save_experiment_figures(
@@ -520,17 +562,29 @@ def main() -> None:
                 error_list,
                 y_true_plot,
                 y_pred_by_method,
-                idx_fit=idx_fit,
+                idx_fit=idx_fit if args.run_baseline else None,
                 metadata={
                     "exp": "exp2",
+                    "scenario": scenario,
                     "window_days": args.window_days,
                     "downsample": int(args.downsample),
+                    "baseline_method": baseline_method if args.run_baseline else None,
+                    "ml_architectures": sorted(y_pred_ml.keys()),
+                    "run_all": bool(args.run_all),
+                    "run_baseline": bool(args.run_baseline),
+                    "normalize": args.normalize,
+                    "n_starts": int(args.n_starts),
+                    "max_test": args.max_test,
+                    "test_size": float(args.test_size),
+                    "val_size": float(args.val_size),
+                    "limit": args.limit,
                     "seed": args.seed,
                     "n_plot": int(args.n_plot),
                 },
             )
 
     artifacts = ["config.json", "metrics.csv", "run.log"]
+    artifacts.append("models/")
     if args.save_predictions:
         artifacts.append("predictions.npz/json")
     if args.save_plots or args.save_plot_data:
@@ -546,9 +600,22 @@ def main() -> None:
             "n_starts",
             "seed",
             "normalize",
+            "run_all",
+            "run_baseline",
             "run_mlp",
             "run_mlp_branched",
             "run_cnn1d",
+            "run_linear",
+            "run_resmlp",
+            "run_tcn",
+            "run_inception",
+            "run_attn_cnn",
+            "run_gru",
+            "run_lstm",
+            "run_conv_gru",
+            "run_transformer",
+            "run_mlp_hetero",
+            "run_mlp_mdn",
             "epochs",
             "patience",
             "batch_size",

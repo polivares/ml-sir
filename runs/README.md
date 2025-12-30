@@ -50,6 +50,7 @@ runs/exp0_20251229_132423/
     param_scatter.png      # only if --save-plots
     param_error_hist.png   # only if --save-plots
     metrics_comparison.png # only if --save-plots
+    architectures.png      # only if --save-plots
     plot_data.npz          # only if --save-plot-data
     plot_data.json         # only if --save-plot-data
 ```
@@ -67,11 +68,29 @@ Purpose: **reproducibility and provenance**.
 Notes:
 - Not every key applies to every method (e.g., `epochs` only matters if you ran ML).
 
+### `models/`
+
+Purpose: **archive ML architectures per run** (weights + diagrams).
+
+Contents:
+- `manifest.json`: list of baselines/ML architectures used, plus file paths for each model artifact.
+- `/<arch>/weights*`: TensorFlow checkpoint files for the trained model weights.
+- `/<arch>/*.weights.h5`: Keras weight file (required filename suffix in Keras 3).
+- `/<arch>/architecture.png`: diagram produced by `tf.keras.utils.plot_model`.
+- `/<arch>/architecture.json`: model JSON config (from `model.to_json()`).
+- `/<arch>/summary.txt`: `model.summary()` captured as text.
+
+Notes:
+- The `architecture.png` diagrams require Graphviz + `pydot`.
+  If missing, the script logs a warning and still saves weights/metadata.
+
 ### `metrics.csv`
 
 Purpose: **the main quantitative output** of each run.
 
-- One row per evaluated method (e.g., `baseline_mse`, `mlp`, `cnn1d`, etc.).
+- One row per evaluated method (e.g., `baseline_mse`, `baseline_mle_poisson`, `mlp`,
+  `resmlp`, `tcn`, `transformer`, `mlp_hetero`, `mlp_mdn`, etc.).
+  - Baseline rows appear only if the run used `--run-baseline` (or `--run-all`).
 - Each row usually contains:
   - `method`: method identifier.
   - `scenario`: scenario string (e.g., `clean`, `train_clean_test_poisson`, etc.).
@@ -94,6 +113,7 @@ All timing values are in **seconds**.
 What is being timed depends on the method:
 
 - **Classical baselines** (`baseline_mse`, `baseline_mle_*`):
+  - Only present if the run used `--run-baseline` (or `--run-all`).
   - The scripts time the **full per-curve fitting procedure** on the subset that was actually fitted
     (typically controlled by `--max-test`).
   - One timing sample ≈ “time to fit one curve”, including **all multi-start restarts**
@@ -102,7 +122,8 @@ What is being timed depends on the method:
     - `time_p50` ≈ typical seconds per curve.
     - `time_p90` ≈ seconds per curve for “harder/slower” curves.
 
-- **Neural models** (`mlp`, `mlp_branched`, `cnn1d`):
+- **Neural models** (`mlp`, `mlp_branched`, `cnn1d`, `linear`, `resmlp`, `tcn`, `inception`,
+  `attn_cnn`, `gru`, `lstm`, `conv_gru`, `transformer`, `mlp_hetero`, `mlp_mdn`):
   - `time_p50/time_p90` summarize a small set of **single-sample inference latencies** collected by
     `predict_time_per_sample()` (repeated `model.predict(X[i:i+1])` calls).
   - This measures **latency** (per-sample, one-by-one), not high-throughput batch prediction.
@@ -130,6 +151,7 @@ Stored arrays (NPZ keys):
 - `y_true`: true `(beta, gamma)` for each test curve (shape: `n_test x 2`).
 - `idx_test`: original dataset indices for the test split.
 - `idx_fit`: indices (within the test set) that were actually fitted by the classical baseline.
+  - Only present if the run used `--run-baseline` (or `--run-all`).
 - `y_pred_<method>`: predicted `(beta, gamma)` per method.
   - For classical baselines, predictions are **NaN** where a curve was not fitted (outside `idx_fit`).
 
@@ -177,6 +199,7 @@ Standard figure outputs (exact list may evolve):
 - `param_scatter.png`: true vs predicted scatter plots for `(beta, gamma)` per method.
 - `param_error_hist.png`: error distributions for `(beta, gamma)` per method.
 - `metrics_comparison.png`: bar charts for key metrics across methods.
+- `architectures.png`: text summary of which baseline(s) and ML architectures are present in the run artifacts.
 
 #### `plot_data.npz` and `plot_data.json` (only if `--save-plot-data`)
 
