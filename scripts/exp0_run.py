@@ -1,8 +1,8 @@
 """Exp0 benchmark on clean simulated SIR curves.
 
-Loads sir.pkl simulations, builds a train/val/test split, fits the classical
-MSE optimizer per curve, and optionally trains neural models (MLP/CNN1D and
-additional architectures).
+Loads sir.pkl simulations, builds a train/val/test split, fits classical
+curve-matching baselines per curve, and optionally trains neural models
+(MLP/CNN1D and additional architectures).
 This is the clean-data baseline for the benchmark suite.
 Writes a run folder with config.json and metrics.csv under runs/.
 Typical usage:
@@ -29,7 +29,7 @@ from src.sir.datasets import (
     normalize_series,
 )
 from src.sir.metrics import per_param_metrics, timing_summary
-from src.sir.baseline import fit_mse
+from src.sir.baseline import fit_mse, fit_wls, fit_log_mse, fit_huber, fit_mse_de
 from src.sir.io import ensure_dir, save_json, save_csv
 from src.sir.cache import hash_config, cache_exists, load_cache, save_cache
 from src.sir.logging_utils import setup_logging
@@ -50,6 +50,18 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--n-starts", type=int, default=5)
     parser.add_argument("--max-test", type=int, default=None)
     parser.add_argument("--run-baseline", action="store_true")
+    parser.add_argument(
+        "--baseline-methods",
+        type=str,
+        default="default",
+        help="Comma-separated baseline methods (mse,wls,log_mse,huber,mse_de) or 'all'/'default'.",
+    )
+    parser.add_argument("--wls-eps", type=float, default=1e-3)
+    parser.add_argument("--log-eps", type=float, default=1e-3)
+    parser.add_argument("--huber-delta", type=float, default=1.0)
+    parser.add_argument("--de-maxiter", type=int, default=100)
+    parser.add_argument("--de-popsize", type=int, default=15)
+    parser.add_argument("--de-polish", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--run-mlp", action="store_true")
     parser.add_argument("--run-mlp-branched", action="store_true")
     parser.add_argument("--run-cnn1d", action="store_true")
@@ -131,6 +143,8 @@ def _apply_run_all(args: argparse.Namespace) -> None:
     if not args.run_all:
         return
     args.run_baseline = True
+    if args.baseline_methods in (None, "", "default"):
+        args.baseline_methods = "all"
     for flag in (
         "run_linear",
         "run_mlp",
@@ -148,6 +162,20 @@ def _apply_run_all(args: argparse.Namespace) -> None:
         "run_mlp_mdn",
     ):
         setattr(args, flag, True)
+
+
+def _resolve_baseline_methods(raw: str) -> list[str]:
+    available = {"mse", "wls", "log_mse", "huber", "mse_de"}
+    if raw is None or raw == "" or raw == "default":
+        return ["mse"]
+    raw = raw.strip().lower()
+    if raw == "all":
+        return sorted(available)
+    methods = [item.strip() for item in raw.split(",") if item.strip()]
+    unknown = [m for m in methods if m not in available]
+    if unknown:
+        raise ValueError(f"Unknown baseline methods: {unknown}. Available: {sorted(available)}")
+    return methods
 
 
 def main() -> None:
@@ -251,47 +279,73 @@ def main() -> None:
     )
 
     results = []
-    baseline_pred: dict[int, np.ndarray] = {}
+    baseline_pred_by_method: dict[str, dict[int, np.ndarray]] = {}
+    baseline_y_pred: dict[str, np.ndarray] = {}
     model_artifacts: list[dict[str, object]] = []
     idx_fit = np.array([], dtype=int)
-    y_pred = y_test[:0]
     y_test_fit = y_test[:0]
 
-    if args.run_baseline:
+    baseline_methods = _resolve_baseline_methods(args.baseline_methods) if args.run_baseline else []
+
+    if args.run_baseline and baseline_methods:
         # Limit classical fitting to keep runtime manageable.
         X_test_fit, idx_fit = _subset(X_test, args.max_test, rng)
         y_test_fit = y_test[idx_fit]
-        logger.info("Baseline MSE fitting on %d curves", X_test_fit.shape[0])
+        logger.info(
+            "Baseline fitting on %d curves (methods=%s)",
+            X_test_fit.shape[0],
+            baseline_methods,
+        )
 
-        # Baseline MSE fit per curve (multi-start).
-        y_pred_list = []
-        fit_times = []
-        start = time.perf_counter()
-        for i in range(X_test_fit.shape[0]):
-            local_rng = np.random.default_rng(args.seed + i)
-            fit = fit_mse(X_test_fit[i], n_starts=args.n_starts, rng=local_rng)
-            y_pred_list.append(fit.params[:2])
-            fit_times.append(sum(fit.times))
-            if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
-                elapsed = time.perf_counter() - start
-                avg = elapsed / (i + 1)
-                logger.info(
-                    "Baseline progress: %d/%d curves (avg %.3fs/curve)",
-                    i + 1,
-                    X_test_fit.shape[0],
-                    avg,
-                )
+        baseline_registry = {
+            "mse": ("baseline_mse", lambda obs, r: fit_mse(obs, n_starts=args.n_starts, rng=r)),
+            "wls": ("baseline_wls", lambda obs, r: fit_wls(obs, n_starts=args.n_starts, wls_eps=args.wls_eps, rng=r)),
+            "log_mse": ("baseline_log_mse", lambda obs, r: fit_log_mse(obs, n_starts=args.n_starts, log_eps=args.log_eps, rng=r)),
+            "huber": ("baseline_huber", lambda obs, r: fit_huber(obs, n_starts=args.n_starts, delta=args.huber_delta, rng=r)),
+            "mse_de": (
+                "baseline_mse_de",
+                lambda obs, r: fit_mse_de(
+                    obs,
+                    maxiter=args.de_maxiter,
+                    popsize=args.de_popsize,
+                    polish=args.de_polish,
+                    rng=r,
+                ),
+            ),
+        }
 
-        y_pred = np.asarray(y_pred_list)
-        baseline_pred = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
-        metrics = per_param_metrics(y_test_fit, y_pred)
-        metrics.update(timing_summary(np.asarray(fit_times)))
-        metrics.update({
-            "method": "baseline_mse",
-            "scenario": "clean",
-            "n_test": int(X_test_fit.shape[0]),
-        })
-        results.append(metrics)
+        for method_key in baseline_methods:
+            label, fitter = baseline_registry[method_key]
+            y_pred_list = []
+            fit_times = []
+            start = time.perf_counter()
+            for i in range(X_test_fit.shape[0]):
+                local_rng = np.random.default_rng(args.seed + i)
+                fit = fitter(X_test_fit[i], local_rng)
+                y_pred_list.append(fit.params[:2])
+                fit_times.append(sum(fit.times))
+                if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
+                    elapsed = time.perf_counter() - start
+                    avg = elapsed / (i + 1)
+                    logger.info(
+                        "Baseline %s progress: %d/%d curves (avg %.3fs/curve)",
+                        label,
+                        i + 1,
+                        X_test_fit.shape[0],
+                        avg,
+                    )
+
+            y_pred = np.asarray(y_pred_list)
+            baseline_pred_by_method[label] = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
+            baseline_y_pred[label] = y_pred
+            metrics = per_param_metrics(y_test_fit, y_pred)
+            metrics.update(timing_summary(np.asarray(fit_times)))
+            metrics.update({
+                "method": label,
+                "scenario": "clean",
+                "n_test": int(X_test_fit.shape[0]),
+            })
+            results.append(metrics)
     else:
         logger.info("Skipping baseline fit (no --run-baseline flag)")
 
@@ -370,10 +424,12 @@ def main() -> None:
             results.append(metrics)
             artifact = ml.save_model_artifacts(model, name, models_dir)
             model_artifacts.append(_relativize_paths(artifact, out_dir))
+            ml.release_model(model)
+            logger.info("Released model resources for %s", name)
     else:
         logger.info("Skipping ML models (no --run-* flags)")
 
-    baseline_methods = ["baseline_mse"] if args.run_baseline else []
+    baseline_methods = sorted(baseline_y_pred.keys())
     ensure_dir(models_dir)
     save_json(
         models_dir / "manifest.json",
@@ -402,11 +458,12 @@ def main() -> None:
         times = DEFAULTS.t0 + np.arange(X_test.shape[1]) * DEFAULTS.dt
         y_pred_by_method = {}
 
-        if args.run_baseline:
-            baseline_full = np.full_like(y_test, np.nan, dtype=float)
-            if idx_fit.size > 0:
-                baseline_full[idx_fit] = y_pred
-            y_pred_by_method["baseline_mse"] = baseline_full
+        if args.run_baseline and baseline_y_pred:
+            for label, y_pred_fit in baseline_y_pred.items():
+                baseline_full = np.full_like(y_test, np.nan, dtype=float)
+                if idx_fit.size > 0:
+                    baseline_full[idx_fit] = y_pred_fit
+                y_pred_by_method[label] = baseline_full
         y_pred_by_method.update(y_pred_ml)
 
         save_predictions(
@@ -420,12 +477,19 @@ def main() -> None:
             metadata={
                 "exp": "exp0",
                 "scenario": "clean",
-                "baseline_method": "baseline_mse" if args.run_baseline else None,
+                "baseline_method": baseline_methods[0] if baseline_methods else None,
+                "baseline_methods": baseline_methods,
                 "ml_architectures": sorted(y_pred_ml.keys()),
                 "run_all": bool(args.run_all),
                 "run_baseline": bool(args.run_baseline),
                 "normalize": args.normalize,
                 "n_starts": int(args.n_starts),
+                "wls_eps": float(args.wls_eps),
+                "log_eps": float(args.log_eps),
+                "huber_delta": float(args.huber_delta),
+                "de_maxiter": int(args.de_maxiter),
+                "de_popsize": int(args.de_popsize),
+                "de_polish": bool(args.de_polish),
                 "max_test": args.max_test,
                 "test_size": float(args.test_size),
                 "val_size": float(args.val_size),
@@ -460,20 +524,21 @@ def main() -> None:
         for idx in plot_idx:
             curves = {"I_true": X_test[idx]}
             errors = {}
-            if idx in baseline_pred:
-                params = baseline_pred[int(idx)]
-                I_pred = simulate_sir(
-                    params[0],
-                    params[1],
-                    s0=DEFAULTS.s0,
-                    i0=DEFAULTS.i0,
-                    r0=DEFAULTS.r0,
-                    t0=DEFAULTS.t0,
-                    t1=t1_eff,
-                    dt=DEFAULTS.dt,
-                )
-                curves["I_pred_baseline"] = I_pred
-                errors["baseline_mse"] = np.abs(I_pred - X_test[idx])
+            for label, pred_map in baseline_pred_by_method.items():
+                if idx in pred_map:
+                    params = pred_map[int(idx)]
+                    I_pred = simulate_sir(
+                        params[0],
+                        params[1],
+                        s0=DEFAULTS.s0,
+                        i0=DEFAULTS.i0,
+                        r0=DEFAULTS.r0,
+                        t0=DEFAULTS.t0,
+                        t1=t1_eff,
+                        dt=DEFAULTS.dt,
+                    )
+                    curves[f"I_pred_{label}"] = I_pred
+                    errors[label] = np.abs(I_pred - X_test[idx])
 
             for method_name, y_pred_full in y_pred_ml.items():
                 params = y_pred_full[idx]
@@ -496,12 +561,19 @@ def main() -> None:
         use_fit_subset = args.run_baseline and idx_fit.size > 0
         if use_fit_subset:
             y_true_plot = y_test_fit
-            y_pred_by_method = {"baseline_mse": y_pred} if args.run_baseline else {}
+            y_pred_by_method = {}
+            for label, y_pred_fit in baseline_y_pred.items():
+                y_pred_by_method[label] = y_pred_fit
             for method_name, y_pred_full in y_pred_ml.items():
                 y_pred_by_method[method_name] = y_pred_full[idx_fit]
         else:
             y_true_plot = y_test
             y_pred_by_method = dict(y_pred_ml)
+            for label, y_pred_fit in baseline_y_pred.items():
+                baseline_full = np.full_like(y_test, np.nan, dtype=float)
+                if idx_fit.size > 0:
+                    baseline_full[idx_fit] = y_pred_fit
+                y_pred_by_method[label] = baseline_full
 
         if args.save_plots:
             viz.save_experiment_figures(
@@ -528,12 +600,19 @@ def main() -> None:
                 metadata={
                     "exp": "exp0",
                     "scenario": "clean",
-                    "baseline_method": "baseline_mse" if args.run_baseline else None,
+                    "baseline_method": baseline_methods[0] if baseline_methods else None,
+                    "baseline_methods": baseline_methods,
                     "ml_architectures": sorted(y_pred_ml.keys()),
                     "run_all": bool(args.run_all),
                     "run_baseline": bool(args.run_baseline),
                     "normalize": args.normalize,
                     "n_starts": int(args.n_starts),
+                    "wls_eps": float(args.wls_eps),
+                    "log_eps": float(args.log_eps),
+                    "huber_delta": float(args.huber_delta),
+                    "de_maxiter": int(args.de_maxiter),
+                    "de_popsize": int(args.de_popsize),
+                    "de_polish": bool(args.de_polish),
                     "max_test": args.max_test,
                     "test_size": float(args.test_size),
                     "val_size": float(args.val_size),
@@ -560,6 +639,13 @@ def main() -> None:
             "normalize",
             "run_all",
             "run_baseline",
+            "baseline_methods",
+            "wls_eps",
+            "log_eps",
+            "huber_delta",
+            "de_maxiter",
+            "de_popsize",
+            "de_polish",
             "run_mlp",
             "run_mlp_branched",
             "run_cnn1d",

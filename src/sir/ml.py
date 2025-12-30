@@ -8,6 +8,7 @@ baselines. Requires TensorFlow to be installed.
 
 
 from dataclasses import dataclass
+import gc
 import logging
 from pathlib import Path
 import shutil
@@ -632,6 +633,22 @@ def save_model_artifacts(
 
     logger.info("Saved model artifacts for %s to %s", name, model_dir)
     return artifacts
+
+
+def release_model(model: "object") -> None:
+    """Release TensorFlow graph/session state to free GPU memory."""
+    tf = _require_tf()
+    try:
+        from tensorflow.keras import backend as K
+
+        K.clear_session()
+    except Exception:
+        pass
+    try:
+        del model
+    except Exception:
+        pass
+    gc.collect()
 
 
 def predict_time_per_sample(model: "object", X: np.ndarray, n_samples: int = 100) -> np.ndarray:

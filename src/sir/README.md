@@ -348,6 +348,8 @@ print(timing_summary(np.array([0.01, 0.02, 0.05])))
     - `[beta, gamma, rho]` si `estimate_rho=True`
 - `loss: float`: valor de la función objetivo (MSE o NLL)
 - `times: List[float]`: tiempos por reinicio (cada llamada a `scipy.optimize.minimize`)
+  - Para métodos con differential evolution (`*_de`), suele ser una sola entrada
+    con el tiempo total de la búsqueda global.
 
 ### `fit_mse`
 
@@ -362,6 +364,30 @@ print(timing_summary(np.array([0.01, 0.02, 0.05])))
   - **Qué optimiza**
     - Minimiza `mean((I_sim(beta,gamma) - I_obs)^2)`
 
+### `fit_wls`
+
+- `fit_wls(I_obs, ..., n_starts=5, wls_eps=1e-3, ...)`
+  - **Qué optimiza**
+    - MSE ponderado con pesos `1 / max(I_obs, wls_eps)` (aprox. varianza Poisson).
+
+### `fit_log_mse`
+
+- `fit_log_mse(I_obs, ..., n_starts=5, log_eps=1e-3, ...)`
+  - **Qué optimiza**
+    - MSE en espacio log: `mean((log(I_sim+eps) - log(I_obs+eps))^2)`
+
+### `fit_huber`
+
+- `fit_huber(I_obs, ..., n_starts=5, delta=1.0, ...)`
+  - **Qué optimiza**
+    - Huber loss (robusta a outliers).
+
+### `fit_mse_de`
+
+- `fit_mse_de(I_obs, ..., maxiter=100, popsize=15, polish=True, ...)`
+  - **Qué optimiza**
+    - MSE usando búsqueda global (differential evolution).
+
 ### `fit_poisson_mle`
 
 - `fit_poisson_mle(Y_obs, rho=DEFAULTS.rho, estimate_rho=False, ... , n_starts=5, ...)`
@@ -375,6 +401,12 @@ print(timing_summary(np.array([0.01, 0.02, 0.05])))
       - `lambda_t = rho * I_sim(t)`
       - `NLL = sum(lambda_t - Y_t * log(lambda_t))`
 
+### `fit_poisson_mle_de`
+
+- `fit_poisson_mle_de(Y_obs, rho=..., estimate_rho=False, maxiter=100, popsize=15, polish=True, ...)`
+  - **Qué optimiza**
+    - NLL Poisson con búsqueda global (differential evolution).
+
 ### `fit_negbin_mle`
 
 - `fit_negbin_mle(Y_obs, rho=DEFAULTS.rho, k=DEFAULTS.k, estimate_rho=False, ...)`
@@ -385,6 +417,12 @@ print(timing_summary(np.array([0.01, 0.02, 0.05])))
   - **Salida**: `FitResult`
   - **Qué optimiza**
     - NLL de NegBin con tamaño `k` y probabilidad `p = k/(k+mu)` para `mu = rho*I_sim`.
+
+### `fit_negbin_mle_de`
+
+- `fit_negbin_mle_de(Y_obs, rho=..., k=..., estimate_rho=False, maxiter=100, popsize=15, polish=True, ...)`
+  - **Qué optimiza**
+    - NLL NegBin con búsqueda global (differential evolution).
 
 **Ejemplo**
 ```python

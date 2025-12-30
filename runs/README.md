@@ -67,6 +67,8 @@ Purpose: **reproducibility and provenance**.
 
 Notes:
 - Not every key applies to every method (e.g., `epochs` only matters if you ran ML).
+- `baseline_methods` in `config.json` captures which classical baselines were requested
+  (controls which baseline rows appear in `metrics.csv`).
 
 ### `models/`
 
@@ -88,8 +90,10 @@ Notes:
 
 Purpose: **the main quantitative output** of each run.
 
-- One row per evaluated method (e.g., `baseline_mse`, `baseline_mle_poisson`, `mlp`,
-  `resmlp`, `tcn`, `transformer`, `mlp_hetero`, `mlp_mdn`, etc.).
+- One row per evaluated method (e.g., `baseline_mse`, `baseline_wls`, `baseline_log_mse`,
+  `baseline_huber`, `baseline_mse_de`, `baseline_mle_poisson`, `baseline_mle_negbin`,
+  `baseline_mle_poisson_de`, `baseline_mle_negbin_de`, `mlp`, `resmlp`, `tcn`,
+  `transformer`, `mlp_hetero`, `mlp_mdn`, etc.).
   - Baseline rows appear only if the run used `--run-baseline` (or `--run-all`).
 - Each row usually contains:
   - `method`: method identifier.
@@ -112,7 +116,8 @@ All timing values are in **seconds**.
 
 What is being timed depends on the method:
 
-- **Classical baselines** (`baseline_mse`, `baseline_mle_*`):
+- **Classical baselines** (`baseline_mse`, `baseline_wls`, `baseline_log_mse`,
+  `baseline_huber`, `baseline_mse_de`, `baseline_mle_*`):
   - Only present if the run used `--run-baseline` (or `--run-all`).
   - The scripts time the **full per-curve fitting procedure** on the subset that was actually fitted
     (typically controlled by `--max-test`).

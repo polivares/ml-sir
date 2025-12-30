@@ -1,8 +1,10 @@
 """Classical baseline fitting for SIR parameters.
 
-Implements MSE fitting to I(t) and MLE for Poisson/NegBin observation models.
-Includes multi-start optimization for robustness and returns timing info.
-Used by Exp0/Exp1/Exp2 as the classical comparison baseline.
+Implements curve-matching baselines (MSE, weighted MSE, log-MSE, Huber),
+plus MLE for Poisson/NegBin observation models and global optimization
+via differential evolution. Includes multi-start optimization for
+robustness and returns timing info. Used by Exp0/Exp1/Exp2 as the
+classical comparison baseline.
 """
 
 
@@ -11,7 +13,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import time
 
 import numpy as np
-from scipy.optimize import minimize
+from scipy.optimize import minimize, differential_evolution
 from scipy.special import gammaln
 
 from .simulate import simulate_sir
@@ -33,6 +35,65 @@ def _mse_objective(
     # Simulate on the same grid as observations.
     I_sim = simulate_sir(beta, gamma, s0=s0, i0=i0, r0=r0, t0=t0, t1=t1, dt=dt)
     return float(np.mean((I_sim - I_obs) ** 2))
+
+
+def _wls_objective(
+    params: np.ndarray,
+    I_obs: np.ndarray,
+    weights: np.ndarray,
+    t0: float,
+    t1: float,
+    dt: float,
+    s0: float,
+    i0: float,
+    r0: float,
+) -> float:
+    # Weighted MSE between simulated and observed I(t).
+    beta, gamma = params
+    I_sim = simulate_sir(beta, gamma, s0=s0, i0=i0, r0=r0, t0=t0, t1=t1, dt=dt)
+    resid = I_sim - I_obs
+    return float(np.mean(weights * resid ** 2))
+
+
+def _log_mse_objective(
+    params: np.ndarray,
+    I_obs: np.ndarray,
+    eps: float,
+    t0: float,
+    t1: float,
+    dt: float,
+    s0: float,
+    i0: float,
+    r0: float,
+) -> float:
+    # MSE in log space (more robust to scale differences).
+    beta, gamma = params
+    I_sim = simulate_sir(beta, gamma, s0=s0, i0=i0, r0=r0, t0=t0, t1=t1, dt=dt)
+    I_sim = np.log(I_sim + eps)
+    I_obs = np.log(I_obs + eps)
+    return float(np.mean((I_sim - I_obs) ** 2))
+
+
+def _huber_objective(
+    params: np.ndarray,
+    I_obs: np.ndarray,
+    delta: float,
+    t0: float,
+    t1: float,
+    dt: float,
+    s0: float,
+    i0: float,
+    r0: float,
+) -> float:
+    # Huber loss between simulated and observed I(t).
+    beta, gamma = params
+    I_sim = simulate_sir(beta, gamma, s0=s0, i0=i0, r0=r0, t0=t0, t1=t1, dt=dt)
+    resid = I_sim - I_obs
+    abs_r = np.abs(resid)
+    quad = np.minimum(abs_r, delta)
+    lin = abs_r - quad
+    loss = 0.5 * quad ** 2 + delta * lin
+    return float(np.mean(loss))
 
 
 def _poisson_nll(
@@ -123,6 +184,29 @@ def _fit_with_multistart(
     return FitResult(params=best_params, loss=best_loss, times=times)
 
 
+def _fit_with_de(
+    objective: Callable[[np.ndarray], float],
+    bounds: List[Tuple[float, float]],
+    rng: np.random.Generator,
+    maxiter: int = 100,
+    popsize: int = 15,
+    polish: bool = True,
+) -> FitResult:
+    # Global optimization via differential evolution.
+    seed = int(rng.integers(0, 2**31 - 1))
+    start = time.perf_counter()
+    res = differential_evolution(
+        objective,
+        bounds=bounds,
+        seed=seed,
+        maxiter=maxiter,
+        popsize=popsize,
+        polish=polish,
+    )
+    elapsed = time.perf_counter() - start
+    return FitResult(params=res.x, loss=float(res.fun), times=[elapsed])
+
+
 def fit_mse(
     I_obs: np.ndarray,
     beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
@@ -143,6 +227,98 @@ def fit_mse(
         return _mse_objective(params, I_obs, t0, t1, dt, s0, i0, r0)
 
     return _fit_with_multistart(obj, [beta_bounds, gamma_bounds], n_starts, rng)
+
+
+def fit_wls(
+    I_obs: np.ndarray,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    n_starts: int = 5,
+    wls_eps: float = 1e-3,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    weights = 1.0 / np.clip(I_obs, wls_eps, None)
+    weights = weights / np.mean(weights)
+
+    def obj(params: np.ndarray) -> float:
+        return _wls_objective(params, I_obs, weights, t0, t1, dt, s0, i0, r0)
+
+    return _fit_with_multistart(obj, [beta_bounds, gamma_bounds], n_starts, rng)
+
+
+def fit_log_mse(
+    I_obs: np.ndarray,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    n_starts: int = 5,
+    log_eps: float = 1e-3,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    def obj(params: np.ndarray) -> float:
+        return _log_mse_objective(params, I_obs, log_eps, t0, t1, dt, s0, i0, r0)
+
+    return _fit_with_multistart(obj, [beta_bounds, gamma_bounds], n_starts, rng)
+
+
+def fit_huber(
+    I_obs: np.ndarray,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    n_starts: int = 5,
+    delta: float = 1.0,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    def obj(params: np.ndarray) -> float:
+        return _huber_objective(params, I_obs, delta, t0, t1, dt, s0, i0, r0)
+
+    return _fit_with_multistart(obj, [beta_bounds, gamma_bounds], n_starts, rng)
+
+
+def fit_mse_de(
+    I_obs: np.ndarray,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    maxiter: int = 100,
+    popsize: int = 15,
+    polish: bool = True,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    def obj(params: np.ndarray) -> float:
+        return _mse_objective(params, I_obs, t0, t1, dt, s0, i0, r0)
+
+    return _fit_with_de(obj, [beta_bounds, gamma_bounds], rng, maxiter=maxiter, popsize=popsize, polish=polish)
 
 
 def fit_poisson_mle(
@@ -174,6 +350,36 @@ def fit_poisson_mle(
     return _fit_with_multistart(obj, bounds, n_starts, rng)
 
 
+def fit_poisson_mle_de(
+    Y_obs: np.ndarray,
+    rho: float = DEFAULTS.rho,
+    estimate_rho: bool = False,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    rho_bounds: Tuple[float, float] = (0.1, 1.0),
+    maxiter: int = 100,
+    popsize: int = 15,
+    polish: bool = True,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    def obj(params: np.ndarray) -> float:
+        return _poisson_nll(params, Y_obs, rho, t0, t1, dt, s0, i0, r0)
+
+    bounds = [beta_bounds, gamma_bounds]
+    if estimate_rho:
+        bounds.append(rho_bounds)
+
+    return _fit_with_de(obj, bounds, rng, maxiter=maxiter, popsize=popsize, polish=polish)
+
+
 def fit_negbin_mle(
     Y_obs: np.ndarray,
     rho: float = DEFAULTS.rho,
@@ -202,3 +408,34 @@ def fit_negbin_mle(
         bounds.append(rho_bounds)
 
     return _fit_with_multistart(obj, bounds, n_starts, rng)
+
+
+def fit_negbin_mle_de(
+    Y_obs: np.ndarray,
+    rho: float = DEFAULTS.rho,
+    k: float = DEFAULTS.k,
+    estimate_rho: bool = False,
+    beta_bounds: Tuple[float, float] = DEFAULTS.beta_range,
+    gamma_bounds: Tuple[float, float] = DEFAULTS.gamma_range,
+    rho_bounds: Tuple[float, float] = (0.1, 1.0),
+    maxiter: int = 100,
+    popsize: int = 15,
+    polish: bool = True,
+    rng: Optional[np.random.Generator] = None,
+    t0: float = DEFAULTS.t0,
+    t1: float = DEFAULTS.t1,
+    dt: float = DEFAULTS.dt,
+    s0: float = DEFAULTS.s0,
+    i0: float = DEFAULTS.i0,
+    r0: float = DEFAULTS.r0,
+) -> FitResult:
+    rng = rng or np.random.default_rng(DEFAULTS.seed)
+
+    def obj(params: np.ndarray) -> float:
+        return _negbin_nll(params, Y_obs, rho, k, t0, t1, dt, s0, i0, r0)
+
+    bounds = [beta_bounds, gamma_bounds]
+    if estimate_rho:
+        bounds.append(rho_bounds)
+
+    return _fit_with_de(obj, bounds, rng, maxiter=maxiter, popsize=popsize, polish=polish)
