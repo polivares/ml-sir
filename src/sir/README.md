@@ -622,6 +622,8 @@ setup_logging(level="INFO", log_file="runs/exp0_debug/run.log")
 **Objetivo**
 - Guardar, por corrida, las series `I(t)` (test), el tiempo `t` y las predicciones `(beta, gamma)`
   por método para auditoría y re-plotting posterior.
+- Opcionalmente, guardar **trayectorias SIR simuladas** desde los parámetros predichos, en un
+  formato compatible con `sir.pkl`.
 
 **Función principal**
 
@@ -635,6 +637,13 @@ setup_logging(level="INFO", log_file="runs/exp0_debug/run.log")
   - **Salidas**:
     - `predictions.npz`: arrays con inputs + predicciones.
     - `predictions.json`: metadata (exp, seed, dt, etc.).
+
+- `save_predicted_sir(out_dir, times, y_pred_by_method, s0, i0, r0, t0, dt, ...)`
+  - **Salida**:
+    - `predicted_sir/predicted_sir_<method>.pkl`: lista de tuplas `(outputs, times, params)`
+      con `outputs` de shape `(T, 3)` (`[S, I, R]`), compatible con `sir.pkl`.
+    - `predicted_sir/predicted_sir_ground_truth.pkl`: mismo formato, usando parámetros reales.
+    - `predicted_sir/predicted_sir_manifest.json`: mapa `method -> file`.
 
 **Ejemplo**
 ```python

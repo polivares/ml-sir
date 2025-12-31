@@ -44,6 +44,10 @@ runs/exp0_20251229_132423/
   run.log
   predictions.npz        # only if --save-predictions
   predictions.json       # only if --save-predictions
+  predicted_sir/         # only if --save-predictions
+    predicted_sir_<method>.pkl
+    predicted_sir_ground_truth.pkl
+    predicted_sir_manifest.json
   figures/               # only if --save-plots or --save-plot-data
     curves_comparison.png  # only if --save-plots
     error_curves.png       # only if --save-plots
@@ -166,12 +170,38 @@ Metadata (JSON):
 - `exp`, `scenario`/`train_mode`/`noise` (depending on experiment),
 - `seed`, `rho`, `k` (when applicable),
 - `s0`, `i0`, `r0`, `t0`, `dt` (needed to re-simulate I(t) from parameters).
+- `predicted_sir_files`: mapping from method name to `predicted_sir_<method>.pkl`.
+- `predicted_sir_files` also includes:
+  - `ground_truth`: `predicted_sir_ground_truth.pkl` (sir.pkl-like from true params).
+  - `manifest`: `predicted_sir_manifest.json` (mapping for convenience).
 
 How to use:
 - To recompute **predicted I(t)** for a given method later, load `y_pred_<method>` and simulate
   with `src.sir.simulate.simulate_sir()` using the saved `s0/i0/r0/t0/dt` and the `times` grid.
 - To generate plots directly from these files, run:
   `python -m src.visualization.visualize --predictions runs/<run>/predictions.npz --plots all`
+
+### `predicted_sir/` (optional)
+
+Purpose: **store full SIR trajectories simulated from predicted (beta, gamma)** so they can be
+used with the same plotting/analysis code as `sir.pkl`.
+
+- Each file `predicted_sir_<method>.pkl` is a list of tuples `(outputs, times, params)` where:
+  - `outputs` has shape `(T, 3)` with columns `[S, I, R]`.
+  - `times` is the time grid for that curve.
+  - `params` is `[beta, gamma]` (the predicted values for that curve).
+- The file format is intentionally **sir.pkl-like** to keep downstream plotting compatible.
+- `predicted_sir_ground_truth.pkl` uses the same tuple format, but with **true** `(beta, gamma)`.
+- `predicted_sir_manifest.json` is a simple map `{method: path}` for quick lookup.
+
+Example usage:
+```python
+import pickle
+
+with open("runs/<run>/predicted_sir/predicted_sir_mlp.pkl", "rb") as f:
+    records = pickle.load(f)
+outputs, times, params = records[0]
+```
 
 ### `run.log`
 

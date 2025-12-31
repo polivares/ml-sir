@@ -25,6 +25,7 @@ from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import matplotlib.pyplot as plt
+from matplotlib import patheffects as pe
 
 from src.sir.config import DEFAULTS
 from src.sir.io import ensure_dir
@@ -254,20 +255,76 @@ def _filter_error_list(
 
 
 def _build_color_map(method_order: Sequence[str]) -> Dict[str, Tuple[float, float, float, float]]:
-    cmap = plt.get_cmap("tab20")
-    colors = [cmap(i % 20) for i in range(len(method_order))]
-    return {method: colors[i] for i, method in enumerate(method_order)}
+    baselines, architectures = _split_method_labels(method_order)
+    base_cmap = plt.get_cmap("Dark2")
+    ml_cmap = plt.get_cmap("tab10")
+    colors: Dict[str, Tuple[float, float, float, float]] = {}
+    for i, method in enumerate(baselines):
+        colors[method] = base_cmap(i % base_cmap.N)
+    for i, method in enumerate(architectures):
+        colors[method] = ml_cmap(i % ml_cmap.N)
+    return colors
 
 
-def _style_for_label(label: str, method: Optional[str], color_map: Mapping[str, object]) -> Dict[str, object]:
+_BASELINE_DASHES = [
+    (0, (6, 2)),
+    (0, (3, 2, 1, 2)),
+    (0, (1, 1)),
+    (0, (4, 2, 1, 2, 1, 2)),
+    (0, (8, 2, 2, 2)),
+]
+_ML_MARKERS = ["o", "s", "D", "^", "v", "P", "X", "*", "h", ">", "<"]
+
+
+def _build_style_map(method_order: Sequence[str]) -> Dict[str, Dict[str, object]]:
+    baselines, architectures = _split_method_labels(method_order)
+    styles: Dict[str, Dict[str, object]] = {}
+    for i, method in enumerate(baselines):
+        styles[method] = {"linestyle": _BASELINE_DASHES[i % len(_BASELINE_DASHES)]}
+    for i, method in enumerate(architectures):
+        styles[method] = {"linestyle": "solid", "marker": _ML_MARKERS[i % len(_ML_MARKERS)]}
+    return styles
+
+
+def _outline_effects(linewidth: float) -> List[pe.AbstractPathEffect]:
+    return [
+        pe.Stroke(linewidth=linewidth + 1.6, foreground="white", alpha=0.85),
+        pe.Normal(),
+    ]
+
+
+def _style_for_label(
+    label: str,
+    method: Optional[str],
+    color_map: Mapping[str, object],
+    style_map: Optional[Mapping[str, Mapping[str, object]]] = None,
+    outline: bool = True,
+) -> Dict[str, object]:
     if label == "I_true":
-        return {"color": "black", "linewidth": 2.2, "zorder": 5}
+        style = {"color": "black", "linewidth": 2.2, "zorder": 2, "alpha": 0.85}
+        if outline:
+            style["path_effects"] = _outline_effects(style["linewidth"])
+        return style
     if label in ("I_obs", "Y_obs"):
-        return {"color": "gray", "linewidth": 1.2, "linestyle": ":", "alpha": 0.8}
+        return {"color": "gray", "linewidth": 1.2, "linestyle": ":", "alpha": 0.8, "zorder": 1}
     if method and method.startswith("baseline_"):
-        return {"color": color_map.get(method), "linewidth": 1.6, "linestyle": "--", "alpha": 0.9}
+        style = {"color": color_map.get(method), "linewidth": 1.6, "alpha": 0.9, "zorder": 3}
+        if style_map and method in style_map:
+            style.update(style_map[method])
+        else:
+            style.setdefault("linestyle", "--")
+        if outline:
+            style["path_effects"] = _outline_effects(style["linewidth"])
+        return style
     if method:
-        return {"color": color_map.get(method), "linewidth": 1.1, "alpha": 0.9}
+        style = {"color": color_map.get(method), "linewidth": 1.3, "alpha": 0.9, "zorder": 4}
+        if style_map and method in style_map:
+            style.update(style_map[method])
+        else:
+            style.setdefault("linestyle", "solid")
+        if outline:
+            style["path_effects"] = _outline_effects(style["linewidth"])
+        return style
     return {"linewidth": 1.0, "alpha": 0.8}
 
 
@@ -326,10 +383,13 @@ def plot_curve_comparison(
     ax: Optional[plt.Axes] = None,
     method_order: Optional[Sequence[str]] = None,
     color_map: Optional[Mapping[str, object]] = None,
+    style_map: Optional[Mapping[str, Mapping[str, object]]] = None,
+    show_markers: bool = True,
 ) -> plt.Axes:
     """Plot multiple curves on the same axis for comparison."""
     ax = ax or plt.gca()
     color_map = color_map or {}
+    style_map = style_map or {}
     for label in _order_labels(curves.keys(), method_order):
         series = curves.get(label)
         if series is None:
@@ -337,12 +397,20 @@ def plot_curve_comparison(
         series = np.asarray(series)
         t = times[: series.shape[-1]]
         method = _label_to_method(label)
-        style = _style_for_label(label, method, color_map)
+        style = _style_for_label(label, method, color_map, style_map=style_map)
+        if show_markers and method and "marker" in style:
+            markevery = max(1, int(series.shape[-1] // 12))
+            style.setdefault("markersize", 4.2)
+            style.setdefault("markeredgewidth", 0.6)
+            style.setdefault("markeredgecolor", "white")
+            style["markevery"] = markevery
+        style.setdefault("solid_capstyle", "round")
         ax.plot(t, series, label=_legend_label(label), **style)
     if title:
         ax.set_title(title)
     ax.set_xlabel(xlabel)
     ax.set_ylabel(ylabel)
+    ax.grid(True, linestyle=":", linewidth=0.6, alpha=0.3)
     return ax
 
 
@@ -358,6 +426,8 @@ def plot_curves_grid(
     method_order: Optional[Sequence[str]] = None,
     color_map: Optional[Mapping[str, object]] = None,
     legend_ncol: Optional[int] = None,
+    style_map: Optional[Mapping[str, Mapping[str, object]]] = None,
+    show_markers: bool = True,
 ) -> plt.Figure:
     """Plot a grid of curve comparisons (one panel per sample)."""
     n = len(curves_list)
@@ -387,6 +457,8 @@ def plot_curves_grid(
             ax=ax,
             method_order=method_order,
             color_map=color_map,
+            style_map=style_map,
+            show_markers=show_markers,
         )
         ax.set_title(f"Sample {i + 1}")
         if legend == "all" or (legend == "first" and i == 0):
@@ -715,6 +787,7 @@ def plot_curve_quantiles(
     figsize: Tuple[float, float] = (7, 4),
     method_order: Optional[Sequence[str]] = None,
     color_map: Optional[Mapping[str, object]] = None,
+    style_map: Optional[Mapping[str, Mapping[str, object]]] = None,
 ) -> plt.Figure:
     """Plot median and quantile bands for each curve label across samples."""
     labels, stacked = stack_curves(curves_list)
@@ -726,6 +799,7 @@ def plot_curve_quantiles(
 
     ordered_labels = _order_labels(labels, method_order)
     color_map = color_map or {}
+    style_map = style_map or {}
     label_to_idx = {label: li for li, label in enumerate(labels)}
     for label in ordered_labels:
         li = label_to_idx[label]
@@ -733,7 +807,7 @@ def plot_curve_quantiles(
         q_vals = np.nanquantile(series_stack, quantiles, axis=0)
         t = times[: q_vals.shape[-1]]
         method = _label_to_method(label)
-        style = _style_for_label(label, method, color_map)
+        style = _style_for_label(label, method, color_map, style_map=style_map)
         ax.plot(t, q_vals[1], label=_legend_label(label), **style)
         fill_color = style.get("color")
         if fill_color is None:
@@ -948,6 +1022,8 @@ def save_experiment_figures(
 
     method_order_plot = _order_methods(y_pred_plot.keys(), selected_methods or method_order)
     color_map = _build_color_map(method_order_plot)
+    style_map = _build_style_map(method_order_plot)
+    style_map = _build_style_map(method_order_plot)
 
     fig = plot_curves_grid(
         times,
@@ -958,6 +1034,8 @@ def save_experiment_figures(
         legend=legend,
         method_order=method_order_plot,
         color_map=color_map,
+        style_map=style_map,
+        show_markers=True,
     )
     paths["curves_comparison"] = save_figure(fig, plot_dir / "curves_comparison.png")
 
@@ -970,6 +1048,8 @@ def save_experiment_figures(
         legend=legend,
         method_order=method_order_plot,
         color_map=color_map,
+        style_map=style_map,
+        show_markers=False,
     )
     paths["error_curves"] = save_figure(fig, plot_dir / "error_curves.png")
 
@@ -1322,6 +1402,8 @@ def main() -> None:
             legend=args.legend,
             method_order=method_order_plot,
             color_map=color_map,
+            style_map=style_map,
+            show_markers=True,
         )
         save_figure(fig, out_dir / f"{args.prefix}curves_comparison.png", dpi=args.dpi)
 
@@ -1335,6 +1417,8 @@ def main() -> None:
             legend=args.legend,
             method_order=method_order_plot,
             color_map=color_map,
+            style_map=style_map,
+            show_markers=False,
         )
         save_figure(fig, out_dir / f"{args.prefix}error_curves.png", dpi=args.dpi)
 
@@ -1415,6 +1499,7 @@ def main() -> None:
             title=f"{title_prefix}: curve quantiles",
             method_order=method_order_plot,
             color_map=color_map,
+            style_map=_build_style_map(method_order_plot),
         )
         save_figure(fig, out_dir / f"{args.prefix}curve_quantiles.png", dpi=args.dpi)
 

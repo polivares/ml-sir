@@ -35,7 +35,7 @@ from src.sir.io import ensure_dir, save_json, save_csv
 from src.sir.cache import hash_config, cache_exists, load_cache, save_cache
 from src.sir.logging_utils import setup_logging
 from src.sir.experiment_log import update_experiment_log, summarize_args
-from src.sir.predictions import save_predictions
+from src.sir.predictions import save_predictions, save_predicted_sir
 from src.sir import ml
 
 
@@ -547,6 +547,24 @@ def main() -> None:
                 y_pred_by_method[label] = baseline_full
         y_pred_by_method.update(y_pred_ml)
 
+        predicted_sir_paths = save_predicted_sir(
+            pred_dir,
+            times=times,
+            y_pred_by_method=y_pred_by_method,
+            s0=DEFAULTS.s0,
+            i0=DEFAULTS.i0,
+            r0=DEFAULTS.r0,
+            t0=DEFAULTS.t0,
+            dt=float(dt_eff),
+            y_true=y_test,
+        )
+        predicted_sir_files = {}
+        for method, path in predicted_sir_paths.items():
+            try:
+                predicted_sir_files[method] = str(path.relative_to(pred_dir))
+            except ValueError:
+                predicted_sir_files[method] = str(path)
+
         save_predictions(
             pred_dir,
             times=times,
@@ -583,6 +601,7 @@ def main() -> None:
                 "r0": DEFAULTS.r0,
                 "t0": DEFAULTS.t0,
                 "dt": float(dt_eff),
+                "predicted_sir_files": predicted_sir_files,
             },
         )
         logger.info("Saved predictions to %s", pred_dir)
@@ -716,6 +735,7 @@ def main() -> None:
     artifacts.append("models/")
     if args.save_predictions:
         artifacts.append("predictions.npz/json")
+        artifacts.append("predicted_sir/")
     if args.save_plots or args.save_plot_data:
         artifacts.append("figures/")
 

@@ -72,6 +72,10 @@ All scripts write a run folder under `runs/` containing:
 - `models/` (one subfolder per ML architecture, weights + `architecture.png` + manifest)
 - `figures/` (if `--save-plots` is enabled)
   - includes standard plots plus `architectures.png` (methods/architectures used)
+- `predicted_sir/` (if `--save-predictions` is enabled)
+  - per-method `predicted_sir_<method>.pkl` with SIR trajectories simulated from predicted params
+  - `predicted_sir_ground_truth.pkl` with trajectories simulated from true params
+  - `predicted_sir_manifest.json` mapping method -> file
 
 Each experiment run also appends an entry to `EXPERIMENTS.md`, which tracks:
 - the **last run per experiment**, and
@@ -96,6 +100,7 @@ Common flags:
 - `--no-log-file`: disable log file output
 - `--no-console-log`: disable console logging
 - `--save-predictions`: save per-curve `I(t)` plus `(beta,gamma)` predictions to `predictions.npz/json`
+  and also write `predicted_sir/predicted_sir_<method>.pkl` (sir.pkl-like).
 - `--pred-dir`: override where prediction artifacts are written (default: run folder)
 - `--save-plots`: generate standard figures under `runs/<run>/figures/`
 - `--save-plot-data`: store `plot_data.npz/json` so plots can be rebuilt later
