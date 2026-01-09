@@ -22,7 +22,7 @@ given **I(t)**, predict **(beta, gamma)**.
 
 ```
 ├── src/sir/                  # Reusable benchmark modules (simulation, datasets, noise, baselines, ML)
-├── scripts/                  # Reproducible benchmark entrypoints (Exp0/Exp1/Exp2 + aggregation)
+├── scripts/                  # Reproducible benchmark entrypoints (Exp0/Exp1/Exp2/Exp3/Exp4 + aggregation)
 ├── src/visualization/        # Plotting helpers (curve comparisons, metrics, etc.)
 ├── notebooks/benchmarks/     # Thin notebooks (run scripts + analyze results)
 ├── notebooks/exploratory/    # Exploratory notebooks (data generation + early experiments)
@@ -86,6 +86,9 @@ Common flags:
 - `--limit`: subsample the dataset (useful for quick runs)
 - `--max-test`: cap number of test curves for classical fitting (runtime control; only if `--run-baseline`)
 - `--normalize {max,population}`: consistent scaling for ML models
+- `--noise {poisson,negbin}`, `--rho`, `--k`, `--estimate-rho`,
+  `--train-mode {clean,noisy,mixed}`, `--rho-range`, `--k-range`, `--p-poisson`
+  (Exp1/Exp4 observation noise)
 - `--run-all`: run every ML architecture available in the experiment
 - `--run-baseline`: run the classical baseline for the experiment
 - `--baseline-methods`: comma-separated list of classical baselines (see experiment sections)
@@ -94,7 +97,7 @@ Common flags:
 - `--wls-eps`, `--log-eps`, `--huber-delta`: curve-matching baseline parameters
 - `--de-maxiter`, `--de-popsize`, `--de-polish`: differential evolution settings
 - `--cache-dir` / `--no-cache`: caching for derived arrays/splits (default `data/processed/sir`)
-- `--progress-every`: how often to log baseline progress (Exp0/Exp1/Exp2)
+- `--progress-every`: how often to log baseline progress (Exp0/Exp1/Exp2/Exp4)
 - `--log-level`: logging verbosity (`INFO` by default)
 - `--log-file`: override log path (default: `runs/<run>/run.log`)
 - `--no-log-file`: disable log file output
@@ -111,6 +114,8 @@ Common flags:
 - `--exp-log`: path to the experiment log (default: `EXPERIMENTS.md`)
 - `--mark-final`: mark this run as the one used for final analysis in the experiment log
 - `--final-note`: optional note stored with the final selection
+- Exp4-only: `--population-range`, `--i0-range`, `--r0-range`, `--init-fraction`,
+  `--feature-mode`, `--feature-scale`
 
 Note: the classical baseline only runs when you pass `--run-baseline` (or `--run-all`).
 Note: plots include all baselines plus the top ML methods by default (see `--plot-max-ml`).
@@ -162,7 +167,13 @@ What it does:
 - Optionally trains ML models under different training modes:
   - `clean`: train on clean I(t), test on noisy observations
   - `noisy`: train/test with the same noise parameters
-  - `mixed`: augmentation sampling noise type/params per series
+  - `mixed`: **per-series augmentation** on the observation model:
+    every train/val series is noised, but for each series the observation parameters
+    are sampled (e.g., `rho_i` from `--rho-range`, and `k_i` from `--k-range` for NegBin),
+    and optionally the noise family (Poisson vs NegBin) is sampled using `--p-poisson`.
+    Note: `mixed` does **not** mean mixing clean/noisy series.
+    If `--p-poisson 1.0`, `mixed` becomes “Poisson-only with per-series rho randomization”
+    (vs `noisy`, which uses the same `rho` for every train/val series).
 
 Run examples:
 ```bash
@@ -218,6 +229,83 @@ Optional plot data (saved under `runs/<run>/figures/`):
 python scripts/exp2_window_downsample.py --window-days 30 --downsample 10 --max-test 200 \
   --run-baseline --baseline-methods mse,wls,log_mse,huber,mse_de \
   --run-mlp --normalize max --save-plot-data --n-plot 9
+```
+
+### Exp3: Rho-sweep runner (under-reporting robustness)
+
+File: `scripts/exp3_run.py`
+
+What it does:
+- Orchestrates multiple Exp1 runs over a grid of `rho` values and train modes to
+  measure robustness to under-reporting (rho shifts).
+- Each run is saved under `runs/exp3_*` and is compatible with aggregation.
+
+Run (example):
+```bash
+python scripts/exp3_run.py \
+  --rho-values 1.0,0.7,0.5,0.3,0.1 \
+  --noise-types poisson,negbin \
+  --train-modes clean,noisy,mixed \
+  --k 10 \
+  --rho-range 0.3 1.0 \
+  --k-range 5 50 \
+  --run-all \
+  --baseline-methods all \
+  --save-predictions
+```
+Note: in mixed mode the runner defaults to the same noise family as the test (i.e., it forces `--p-poisson 1.0`
+for Poisson tests and `--p-poisson 0.0` for NegBin tests), so “mixed” becomes per-series parameter randomization.
+Use `--no-force-single-noise` to allow Poisson/NegBin mixing in train/val.
+Note: use `--exp1-exp-log <path>` if you want to prevent Exp1 entries from being written to
+`EXPERIMENTS.md` while running Exp3.
+Note: by default Exp3 auto-selects the **top 2 baselines** and **top 2 ML methods** from the
+final Exp1 run recorded in `EXPERIMENTS.md`, ranking by mean **R2** (higher is better).
+If R2 is missing, it falls back to MAE then RMSE. Use `--no-auto-select` to disable this, or
+`--exp1-final-log`/`--top-baselines`/`--top-ml` to adjust the selection source.
+
+### Exp4: Variable initial conditions (S0/I0/N)
+
+File: `scripts/exp4_varinit.py`
+
+What it does:
+- Re-simulates SIR curves using betas/gammas sampled from `sir.pkl` while varying
+  population size (N) and initial conditions (S0/I0).
+- Applies observation noise (Poisson/NegBin) and supports train modes
+  `clean`/`noisy`/`mixed` like Exp1 (test is always noisy).
+- Optionally appends static features `(S0, I0, N)` to ML inputs.
+
+Run (example, single scenario):
+```bash
+python scripts/exp4_varinit.py \
+  --population-range 50 500 \
+  --i0-range 0.01 0.2 \
+  --r0-range 0 0 \
+  --feature-mode append \
+  --feature-scale fraction \
+  --noise poisson \
+  --train-mode mixed \
+  --save-predictions
+```
+Note: if `--feature-mode append` is used, the extra features are concatenated to the input
+vector; this changes the effective input length for all ML architectures.
+Note: by default Exp4 auto-selects the **top 2 baselines** and **top 2 ML methods** from the
+final Exp1 run recorded in `EXPERIMENTS.md`, ranking by mean **R2** (higher is better).
+If R2 is missing, it falls back to MAE then RMSE. Use `--no-auto-select` to disable this,
+or `--exp1-final-log`/`--top-baselines`/`--top-ml` to adjust the selection source.
+If you want to run all methods, add `--no-auto-select --run-all --baseline-methods all`.
+
+Runner (noise types + train modes):
+- File: `scripts/exp4_run.py`
+```bash
+python scripts/exp4_run.py \
+  --noise-types poisson,negbin \
+  --train-modes clean,noisy,mixed \
+  --population-range 50 500 \
+  --i0-range 0.01 0.2 \
+  --r0-range 0 0 \
+  --feature-mode append \
+  --feature-scale fraction \
+  --save-predictions
 ```
 
 ### Aggregation

@@ -25,6 +25,9 @@ runs/
   exp0_YYYYMMDD_HHMMSS/
   exp1_YYYYMMDD_HHMMSS/
   exp2_YYYYMMDD_HHMMSS/
+  exp3_YYYYMMDD_HHMMSS_01_poisson_clean_rho1/
+  exp4_YYYYMMDD_HHMMSS/
+  exp4_YYYYMMDD_HHMMSS_01_poisson_clean_rho1/
 ```
 
 Where:
@@ -158,8 +161,10 @@ Purpose: **store per-curve inputs and parameter predictions** so you can re-plot
 Stored arrays (NPZ keys):
 - `times`: time grid used for the test series (after any window/downsample transforms).
 - `i_true`: test I(t) series used for evaluation (shape: `n_test x T`).
-- `i_obs`: only in Exp1; the observed noisy series `Y_obs` (shape: `n_test x T`).
+- `i_obs`: in Exp1 and Exp4 when observation noise is enabled; the observed noisy series `Y_obs`
+  (shape: `n_test x T`).
 - `y_true`: true `(beta, gamma)` for each test curve (shape: `n_test x 2`).
+- `s0`, `i0`, `r0`, `pop`: per-curve initial conditions/population (Exp4 only).
 - `idx_test`: original dataset indices for the test split.
 - `idx_fit`: indices (within the test set) that were actually fitted by the classical baseline.
   - Only present if the run used `--run-baseline` (or `--run-all`).
@@ -169,7 +174,8 @@ Stored arrays (NPZ keys):
 Metadata (JSON):
 - `exp`, `scenario`/`train_mode`/`noise` (depending on experiment),
 - `seed`, `rho`, `k` (when applicable),
-- `s0`, `i0`, `r0`, `t0`, `dt` (needed to re-simulate I(t) from parameters).
+- `s0`, `i0`, `r0`, `t0`, `dt` (for fixed-init experiments).
+  - In Exp4 (variable init), per-curve `s0/i0/r0` live in `predictions.npz`.
 - `predicted_sir_files`: mapping from method name to `predicted_sir_<method>.pkl`.
 - `predicted_sir_files` also includes:
   - `ground_truth`: `predicted_sir_ground_truth.pkl` (sir.pkl-like from true params).
@@ -185,6 +191,9 @@ How to use:
 
 Purpose: **store full SIR trajectories simulated from predicted (beta, gamma)** so they can be
 used with the same plotting/analysis code as `sir.pkl`.
+
+Note:
+- For Exp4 (variable init), trajectories are simulated using each curve’s own `s0/i0/r0`.
 
 - Each file `predicted_sir_<method>.pkl` is a list of tuples `(outputs, times, params)` where:
   - `outputs` has shape `(T, 3)` with columns `[S, I, R]`.

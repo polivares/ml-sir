@@ -634,6 +634,7 @@ setup_logging(level="INFO", log_file="runs/exp0_debug/run.log")
     - `y_true`: `(beta, gamma)` verdadero (shape `n_test x 2`).
     - `y_pred_by_method`: dict con predicciones por método.
     - `i_obs`: opcional (solo Exp1) para observaciones ruidosas.
+    - `extra_arrays`: dict opcional para guardar arrays adicionales (por ejemplo `s0`, `i0`, `r0`, `pop`).
   - **Salidas**:
     - `predictions.npz`: arrays con inputs + predicciones.
     - `predictions.json`: metadata (exp, seed, dt, etc.).
@@ -644,6 +645,9 @@ setup_logging(level="INFO", log_file="runs/exp0_debug/run.log")
       con `outputs` de shape `(T, 3)` (`[S, I, R]`), compatible con `sir.pkl`.
     - `predicted_sir/predicted_sir_ground_truth.pkl`: mismo formato, usando parámetros reales.
     - `predicted_sir/predicted_sir_manifest.json`: mapa `method -> file`.
+  - **Nota**:
+    - Si se pasa `init_states` (shape `n_curvas x 3`), se simula cada curva con su
+      `(S0, I0, R0)` correspondiente en vez de usar un único estado inicial global.
 
 **Ejemplo**
 ```python

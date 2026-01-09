@@ -12,6 +12,8 @@ artifacts (predictions.npz/json and optionally metrics.csv), e.g.:
   python -m src.visualization.visualize --predictions runs/exp0_.../predictions.npz
 The plotting script limits the number of ML methods by default (for readability);
 override with --plot-max-ml/--plot-max-baseline when needed.
+If predictions.npz includes per-curve `s0/i0/r0` arrays, those are used when
+reconstructing simulated curves.
 """
 
 from __future__ import annotations
@@ -1158,6 +1160,10 @@ def _title_from_meta(meta: Dict[str, object]) -> str:
         return f"Exp2 (window={meta.get('window_days')}, downsample={meta.get('downsample')})"
     if exp == "exp0":
         return "Exp0"
+    if exp == "exp3":
+        return "Exp3"
+    if exp == "exp4":
+        return "Exp4 (variable init)"
     return "Experiment"
 
 
@@ -1184,6 +1190,7 @@ def _build_curves(
     meta: Dict[str, object],
     include_obs: bool = False,
     i_obs: Optional[np.ndarray] = None,
+    init_states: Optional[np.ndarray] = None,
 ) -> Tuple[List[Dict[str, np.ndarray]], List[Dict[str, np.ndarray]]]:
     from src.sir.simulate import simulate_sir
 
@@ -1193,11 +1200,20 @@ def _build_curves(
     curves_list: List[Dict[str, np.ndarray]] = []
     error_list: List[Dict[str, np.ndarray]] = []
 
+    init_states_arr: Optional[np.ndarray] = None
+    if init_states is not None:
+        init_states_arr = np.asarray(init_states, dtype=float)
+
     for idx in plot_idx:
         curves: Dict[str, np.ndarray] = {"I_true": i_true[idx]}
         if include_obs and i_obs is not None:
             curves["I_obs"] = i_obs[idx]
         errors: Dict[str, np.ndarray] = {}
+
+        if init_states_arr is not None and idx < init_states_arr.shape[0]:
+            s0_i, i0_i, r0_i = init_states_arr[idx][:3]
+        else:
+            s0_i, i0_i, r0_i = s0, i0, r0
 
         for label, y_pred in y_pred_by_method.items():
             if y_pred is None:
@@ -1208,9 +1224,9 @@ def _build_curves(
             I_pred = simulate_sir(
                 params[0],
                 params[1],
-                s0=s0,
-                i0=i0,
-                r0=r0,
+                s0=s0_i,
+                i0=i0_i,
+                r0=r0_i,
                 t0=t0,
                 t1=t1,
                 dt=dt,
@@ -1316,6 +1332,9 @@ def main() -> None:
     i_true = np.asarray(arrays["i_true"])
     y_true = np.asarray(arrays["y_true"])
     i_obs = arrays.get("i_obs")
+    init_states = None
+    if "s0" in arrays and "i0" in arrays and "r0" in arrays:
+        init_states = np.column_stack([arrays["s0"], arrays["i0"], arrays["r0"]])
 
     y_pred_by_method: Dict[str, np.ndarray] = {}
     labels = meta.get("y_pred_labels")
@@ -1384,6 +1403,7 @@ def main() -> None:
             meta,
             include_obs=args.include_obs,
             i_obs=i_obs if args.include_obs else None,
+            init_states=init_states,
         )
     else:
         curves_list = []

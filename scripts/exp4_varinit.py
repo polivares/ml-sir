@@ -1,0 +1,1425 @@
+"""Exp4 benchmark with variable initial conditions and population size.
+
+Generates a new dataset by re-simulating SIR curves using betas/gammas sampled
+from sir.pkl while varying (S0, I0, N). Optionally appends static features
+(S0, I0, N) to the ML inputs. Supports the same observation-noise protocol as
+Exp1 (clean/noisy/mixed train modes with Poisson/NegBin test noise). Runs
+classical baselines and ML models, writes a standard run folder with
+config.json/metrics.csv, plus optional plots and prediction artifacts. By
+default it auto-selects the top methods from the final Exp1 run in
+EXPERIMENTS.md (disable with --no-auto-select).
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+from datetime import datetime
+import logging
+from pathlib import Path
+import re
+import time
+from typing import Optional, Tuple
+
+import numpy as np
+
+from src.sir.config import DEFAULTS, set_global_seed
+from src.sir.datasets import load_sir_pkl, train_val_test_split, normalize_series
+from src.sir.metrics import per_param_metrics, timing_summary
+from src.sir.baseline import (
+    fit_huber,
+    fit_log_mse,
+    fit_mse,
+    fit_mse_de,
+    fit_negbin_mle,
+    fit_negbin_mle_de,
+    fit_poisson_mle,
+    fit_poisson_mle_de,
+    fit_wls,
+)
+from src.sir.noise import observe_negbin, observe_poisson
+from src.sir.simulate import simulate_sir
+from src.sir.io import ensure_dir, save_json, save_csv
+from src.sir.cache import hash_config, cache_exists, load_cache, save_cache
+from src.sir.logging_utils import setup_logging
+from src.sir.experiment_log import update_experiment_log, summarize_args
+from src.sir.predictions import save_predictions, save_predicted_sir
+from src.sir import ml
+
+
+BASELINE_METHODS = {
+    "mle_poisson",
+    "mle_negbin",
+    "mle_poisson_de",
+    "mle_negbin_de",
+    "mse",
+    "wls",
+    "log_mse",
+    "huber",
+    "mse_de",
+}
+ML_FLAG_MAP = {
+    "linear": "run_linear",
+    "mlp": "run_mlp",
+    "mlp_branched": "run_mlp_branched",
+    "resmlp": "run_resmlp",
+    "cnn1d": "run_cnn1d",
+    "tcn": "run_tcn",
+    "inception": "run_inception",
+    "attn_cnn": "run_attn_cnn",
+    "gru": "run_gru",
+    "lstm": "run_lstm",
+    "conv_gru": "run_conv_gru",
+    "transformer": "run_transformer",
+    "mlp_hetero": "run_mlp_hetero",
+    "mlp_mdn": "run_mlp_mdn",
+}
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run Exp4 benchmark (variable initial conditions).")
+    parser.add_argument("--data-path", type=str, default=str(DEFAULTS.data_path))
+    parser.add_argument("--limit", type=int, default=5000)
+    parser.add_argument("--seed", type=int, default=DEFAULTS.seed)
+    parser.add_argument("--test-size", type=float, default=DEFAULTS.test_size)
+    parser.add_argument("--val-size", type=float, default=DEFAULTS.val_size)
+    parser.add_argument("--normalize", type=str, default=None, choices=[None, "max", "population"])
+    parser.add_argument("--noise", type=str, default="poisson", choices=["poisson", "negbin"])
+    parser.add_argument("--rho", type=float, default=DEFAULTS.rho)
+    parser.add_argument("--k", type=float, default=DEFAULTS.k)
+    parser.add_argument("--estimate-rho", action="store_true")
+    parser.add_argument("--train-mode", type=str, default="clean", choices=["clean", "noisy", "mixed"])
+    parser.add_argument("--rho-range", type=float, nargs=2, default=(0.3, 1.0))
+    parser.add_argument("--k-range", type=float, nargs=2, default=(5.0, 50.0))
+    parser.add_argument("--p-poisson", type=float, default=0.5)
+    parser.add_argument("--population-range", type=float, nargs=2, default=(50.0, 500.0))
+    parser.add_argument("--i0-range", type=float, nargs=2, default=(0.01, 0.2))
+    parser.add_argument("--r0-range", type=float, nargs=2, default=(0.0, 0.0))
+    parser.add_argument(
+        "--init-fraction",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Interpret i0/r0 ranges as fractions of N (default: true).",
+    )
+    parser.add_argument(
+        "--feature-mode",
+        type=str,
+        default="none",
+        choices=["none", "append"],
+        help="Append static features (S0, I0, N) to the ML input.",
+    )
+    parser.add_argument(
+        "--feature-scale",
+        type=str,
+        default="fraction",
+        choices=["absolute", "fraction"],
+        help="Scale static features as absolute values or fractions of N.",
+    )
+    parser.add_argument("--n-starts", type=int, default=5)
+    parser.add_argument("--max-test", type=int, default=None)
+    parser.add_argument("--run-baseline", action="store_true")
+    parser.add_argument(
+        "--baseline-methods",
+        type=str,
+        default="default",
+        help=(
+            "Comma-separated baseline methods "
+            "(mle_poisson,mle_negbin,mle_poisson_de,mle_negbin_de,mse,wls,log_mse,huber,mse_de) "
+            "or 'all'/'default'."
+        ),
+    )
+    parser.add_argument("--wls-eps", type=float, default=1e-3)
+    parser.add_argument("--log-eps", type=float, default=1e-3)
+    parser.add_argument("--huber-delta", type=float, default=1.0)
+    parser.add_argument("--de-maxiter", type=int, default=100)
+    parser.add_argument("--de-popsize", type=int, default=15)
+    parser.add_argument("--de-polish", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--run-mlp", action="store_true")
+    parser.add_argument("--run-mlp-branched", action="store_true")
+    parser.add_argument("--run-cnn1d", action="store_true")
+    parser.add_argument("--run-linear", action="store_true")
+    parser.add_argument("--run-resmlp", action="store_true")
+    parser.add_argument("--run-tcn", action="store_true")
+    parser.add_argument("--run-inception", action="store_true")
+    parser.add_argument("--run-attn-cnn", action="store_true")
+    parser.add_argument("--run-gru", action="store_true")
+    parser.add_argument("--run-lstm", action="store_true")
+    parser.add_argument("--run-conv-gru", action="store_true")
+    parser.add_argument("--run-transformer", action="store_true")
+    parser.add_argument("--run-mlp-hetero", action="store_true")
+    parser.add_argument("--run-mlp-mdn", action="store_true")
+    parser.add_argument("--run-all", action="store_true")
+    parser.add_argument(
+        "--auto-select",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Auto-select top methods from the final Exp1 run in EXPERIMENTS.md.",
+    )
+    parser.add_argument(
+        "--exp1-final-log",
+        type=str,
+        default="EXPERIMENTS.md",
+        help="Experiment log to read the final Exp1 selection from.",
+    )
+    parser.add_argument("--top-baselines", type=int, default=2)
+    parser.add_argument("--top-ml", type=int, default=2)
+    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--patience", type=int, default=15)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--save-plots", action="store_true")
+    parser.add_argument("--save-plot-data", action="store_true")
+    parser.add_argument("--n-plot", type=int, default=9)
+    parser.add_argument("--plot-dir", type=str, default=None)
+    parser.add_argument("--plot-max-ml", type=int, default=4)
+    parser.add_argument("--plot-max-baseline", type=int, default=0)
+    parser.add_argument(
+        "--plot-legend",
+        type=str,
+        default="global",
+        choices=["global", "first", "all", "none"],
+    )
+    parser.add_argument("--save-predictions", action="store_true")
+    parser.add_argument("--pred-dir", type=str, default=None)
+    parser.add_argument("--cache-dir", type=str, default="data/processed/sir")
+    parser.add_argument("--no-cache", action="store_true")
+    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--progress-every", type=int, default=25)
+    parser.add_argument("--log-level", type=str, default="INFO")
+    parser.add_argument("--log-file", type=str, default=None)
+    parser.add_argument("--no-log-file", action="store_true")
+    parser.add_argument("--no-console-log", action="store_true")
+    parser.add_argument("--exp-log", type=str, default="EXPERIMENTS.md")
+    parser.add_argument("--mark-final", action="store_true")
+    parser.add_argument("--final-note", type=str, default=None)
+    return parser.parse_args()
+
+
+def _subset(
+    arr: np.ndarray,
+    max_n: Optional[int],
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray]:
+    # Optionally cap the number of curves to keep runtime bounded.
+    if max_n is None or max_n <= 0:
+        idx = np.arange(arr.shape[0])
+        return arr, idx
+    if arr.shape[0] <= max_n:
+        idx = np.arange(arr.shape[0])
+        return arr, idx
+    idx = rng.choice(arr.shape[0], size=max_n, replace=False)
+    return arr[idx], idx
+
+
+def _apply_noise_batch(
+    X: np.ndarray,
+    noise: str,
+    rho: float,
+    k: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
+    if noise == "poisson":
+        return observe_poisson(X, rho=rho, rng=rng).astype(np.float32)
+    if noise == "negbin":
+        return observe_negbin(X, rho=rho, k=k, rng=rng).astype(np.float32)
+    raise ValueError("Unknown noise type")
+
+
+def _apply_mixed_noise(
+    X: np.ndarray,
+    rho_range: tuple[float, float],
+    k_range: tuple[float, float],
+    p_poisson: float,
+    rng: np.random.Generator,
+) -> np.ndarray:
+    out = np.zeros_like(X, dtype=np.float32)
+    for i in range(X.shape[0]):
+        if rng.random() < p_poisson:
+            rho = rng.uniform(*rho_range)
+            series = np.nan_to_num(X[i], nan=0.0, posinf=0.0, neginf=0.0)
+            out[i] = observe_poisson(series, rho=rho, rng=rng)
+        else:
+            rho = rng.uniform(*rho_range)
+            k = rng.uniform(*k_range)
+            series = np.nan_to_num(X[i], nan=0.0, posinf=0.0, neginf=0.0)
+            out[i] = observe_negbin(series, rho=rho, k=k, rng=rng)
+    return out
+
+
+def _choose_plot_indices(pool: np.ndarray, n_plot: int, rng: np.random.Generator) -> np.ndarray:
+    """Choose a reproducible subset of indices for plotting."""
+    if pool.size <= n_plot:
+        return np.sort(pool)
+    return np.sort(rng.choice(pool, size=n_plot, replace=False))
+
+
+def _relativize_paths(payload: dict[str, object], root: Path) -> dict[str, object]:
+    """Convert Path objects in a dict to root-relative strings."""
+    def _convert(value: object) -> object:
+        if isinstance(value, Path):
+            try:
+                return str(value.relative_to(root))
+            except ValueError:
+                return str(value)
+        if isinstance(value, list):
+            return [_convert(item) for item in value]
+        return value
+
+    return {key: _convert(val) for key, val in payload.items()}
+
+
+def _extract_block(text: str, start: str, end: str) -> str:
+    if start in text and end in text:
+        _, rest = text.split(start, 1)
+        content, _ = rest.split(end, 1)
+        return content.strip()
+    return ""
+
+
+def _load_final_run(exp_log: Path, exp_key: str) -> Optional[Path]:
+    if not exp_log.exists():
+        return None
+    text = exp_log.read_text(encoding="utf-8")
+    start = f"<!-- {exp_key.upper()}_FINAL_START -->"
+    end = f"<!-- {exp_key.upper()}_FINAL_END -->"
+    block = _extract_block(text, start, end)
+    if not block:
+        return None
+    lines = [ln.strip() for ln in block.splitlines() if ln.strip()]
+    checked = [ln for ln in lines if ln.lower().startswith("- [x]")]
+    if not checked:
+        return None
+    line = checked[-1]
+    match = re.search(r"run_dir: `([^`]+)`", line)
+    if not match:
+        return None
+    return Path(match.group(1))
+
+
+def _parse_metrics(path: Path) -> list[dict[str, object]]:
+    rows: list[dict[str, object]] = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            parsed: dict[str, object] = {}
+            for key, value in row.items():
+                if value is None or value == "":
+                    parsed[key] = ""
+                    continue
+                if key in ("method", "scenario", "run_dir", "exp"):
+                    parsed[key] = value
+                    continue
+                try:
+                    parsed[key] = float(value)
+                except ValueError:
+                    parsed[key] = value
+            rows.append(parsed)
+    return rows
+
+
+def _score_row(row: dict[str, object]) -> Optional[float]:
+    def _get(key: str) -> Optional[float]:
+        value = row.get(key)
+        if value is None or value == "":
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(v):
+            return None
+        return v
+
+    r2_beta = _get("r2_beta")
+    r2_gamma = _get("r2_gamma")
+    if r2_beta is not None or r2_gamma is not None:
+        vals = [v for v in (r2_beta, r2_gamma) if v is not None]
+        return -float(np.mean(vals)) if vals else None
+
+    mae_beta = _get("mae_beta")
+    mae_gamma = _get("mae_gamma")
+    if mae_beta is not None or mae_gamma is not None:
+        vals = [v for v in (mae_beta, mae_gamma) if v is not None]
+        return float(np.mean(vals)) if vals else None
+
+    rmse_beta = _get("rmse_beta")
+    rmse_gamma = _get("rmse_gamma")
+    if rmse_beta is not None or rmse_gamma is not None:
+        vals = [v for v in (rmse_beta, rmse_gamma) if v is not None]
+        return float(np.mean(vals)) if vals else None
+
+    return None
+
+
+def _select_best_methods(
+    metrics_rows: list[dict[str, object]],
+    top_baselines: int,
+    top_ml: int,
+) -> tuple[list[str], list[str]]:
+    scores: dict[str, list[float]] = {}
+    for row in metrics_rows:
+        method = row.get("method")
+        if not method:
+            continue
+        score = _score_row(row)
+        if score is None:
+            continue
+        scores.setdefault(str(method), []).append(score)
+
+    avg_scores = {m: float(np.mean(vals)) for m, vals in scores.items() if vals}
+
+    baseline_scores = {m: s for m, s in avg_scores.items() if m.startswith("baseline_")}
+    ml_scores = {m: s for m, s in avg_scores.items() if not m.startswith("baseline_")}
+
+    best_baselines = [m for m, _ in sorted(baseline_scores.items(), key=lambda x: x[1])][:top_baselines]
+    best_ml = [m for m, _ in sorted(ml_scores.items(), key=lambda x: x[1])][:top_ml]
+    return best_baselines, best_ml
+
+
+def _baseline_label_to_method(label: str) -> Optional[str]:
+    if not label.startswith("baseline_"):
+        return None
+    method = label[len("baseline_"):]
+    if method in BASELINE_METHODS:
+        return method
+    return None
+
+
+def _apply_auto_select(args: argparse.Namespace, logger: logging.Logger) -> bool:
+    if not args.auto_select:
+        return False
+    exp1_run_dir = _load_final_run(Path(args.exp1_final_log), exp_key="exp1")
+    if exp1_run_dir is None:
+        logger.warning("No final Exp1 run found in %s; falling back to CLI flags.", args.exp1_final_log)
+        return False
+    metrics_path = exp1_run_dir / "metrics.csv"
+    if not metrics_path.exists():
+        logger.warning("Missing metrics.csv at %s; falling back to CLI flags.", metrics_path)
+        return False
+    metrics_rows = _parse_metrics(metrics_path)
+    best_baselines, best_ml = _select_best_methods(metrics_rows, args.top_baselines, args.top_ml)
+    baseline_methods = [m for m in (_baseline_label_to_method(x) for x in best_baselines) if m]
+    ml_methods = [m for m in best_ml if m in ML_FLAG_MAP]
+    if not baseline_methods or not ml_methods:
+        logger.warning("Could not auto-select both baselines and ML methods; falling back to CLI flags.")
+        return False
+
+    args.run_all = False
+    args.run_baseline = True
+    args.baseline_methods = ",".join(baseline_methods)
+    for attr in ML_FLAG_MAP.values():
+        setattr(args, attr, False)
+    for method in ml_methods:
+        setattr(args, ML_FLAG_MAP[method], True)
+    logger.info("Auto-selected baselines: %s", baseline_methods)
+    logger.info("Auto-selected ML methods: %s", ml_methods)
+    return True
+
+
+def _apply_run_all(args: argparse.Namespace) -> None:
+    """Enable every ML architecture flag when --run-all is set."""
+    if not args.run_all:
+        return
+    args.run_baseline = True
+    if args.baseline_methods in (None, "", "default"):
+        args.baseline_methods = "all"
+    for flag in ML_FLAG_MAP.values():
+        setattr(args, flag, True)
+
+
+def _resolve_baseline_methods(raw: str, noise: str) -> list[str]:
+    if raw is None or raw == "" or raw == "default":
+        return [f"mle_{noise}"]
+    raw = raw.strip().lower()
+    if raw == "all":
+        return sorted(BASELINE_METHODS)
+    methods = [item.strip() for item in raw.split(",") if item.strip()]
+    expanded: list[str] = []
+    for method in methods:
+        if method == "mle":
+            expanded.append(f"mle_{noise}")
+        elif method == "mle_de":
+            expanded.append(f"mle_{noise}_de")
+        else:
+            expanded.append(method)
+    unknown = [m for m in expanded if m not in BASELINE_METHODS]
+    if unknown:
+        raise ValueError(f"Unknown baseline methods: {unknown}. Available: {sorted(BASELINE_METHODS)}")
+    return expanded
+
+
+def _resolve_time_grid(data: list) -> tuple[float, float, float, np.ndarray]:
+    if data:
+        times = np.asarray(data[0][1], dtype=float)
+        if times.ndim == 1 and times.size >= 2:
+            t0 = float(times[0])
+            dt = float(np.median(np.diff(times)))
+            t1 = float(times[-1])
+            return t0, t1, dt, times
+    t0 = DEFAULTS.t0
+    t1 = DEFAULTS.t1
+    dt = DEFAULTS.dt
+    steps = int(round((t1 - t0) / dt)) + 1
+    times = t0 + np.arange(steps) * dt
+    return t0, t1, dt, times
+
+
+def _sample_initial_conditions(
+    n: int,
+    pop_range: Tuple[float, float],
+    i0_range: Tuple[float, float],
+    r0_range: Tuple[float, float],
+    use_fractions: bool,
+    rng: np.random.Generator,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    s0 = np.zeros(n, dtype=float)
+    i0 = np.zeros(n, dtype=float)
+    r0 = np.zeros(n, dtype=float)
+    pop = np.zeros(n, dtype=float)
+
+    pop_min, pop_max = pop_range
+    i0_min, i0_max = i0_range
+    r0_min, r0_max = r0_range
+
+    for idx in range(n):
+        for _ in range(200):
+            pop_i = rng.uniform(pop_min, pop_max)
+            if use_fractions:
+                i0_frac = rng.uniform(i0_min, i0_max)
+                r0_frac = rng.uniform(r0_min, r0_max)
+                if i0_frac + r0_frac >= 1.0:
+                    continue
+                i0_i = pop_i * i0_frac
+                r0_i = pop_i * r0_frac
+            else:
+                i0_i = rng.uniform(i0_min, i0_max)
+                r0_i = rng.uniform(r0_min, r0_max)
+                if i0_i + r0_i >= pop_i:
+                    continue
+            s0_i = pop_i - i0_i - r0_i
+            s0[idx] = s0_i
+            i0[idx] = i0_i
+            r0[idx] = r0_i
+            pop[idx] = pop_i
+            break
+        else:
+            # Fallback: force a valid triplet by shrinking i0/r0.
+            pop_i = rng.uniform(pop_min, pop_max)
+            i0_i = min(i0_max, 0.1 * pop_i)
+            r0_i = min(r0_max, 0.0)
+            s0[idx] = max(pop_i - i0_i - r0_i, 1e-6)
+            i0[idx] = i0_i
+            r0[idx] = r0_i
+            pop[idx] = pop_i
+
+    return s0, i0, r0, pop
+
+
+def _simulate_curves(
+    params: np.ndarray,
+    s0: np.ndarray,
+    i0: np.ndarray,
+    r0: np.ndarray,
+    t0: float,
+    t1: float,
+    dt: float,
+    times: np.ndarray,
+    logger: logging.Logger,
+    progress_every: int,
+) -> np.ndarray:
+    n = params.shape[0]
+    t_len = times.shape[0]
+    X = np.full((n, t_len), np.nan, dtype=np.float32)
+
+    for idx in range(n):
+        beta, gamma = params[idx][:2]
+        try:
+            _, outputs = simulate_sir(
+                beta,
+                gamma,
+                s0=float(s0[idx]),
+                i0=float(i0[idx]),
+                r0=float(r0[idx]),
+                t0=t0,
+                t1=t1,
+                dt=dt,
+                return_full=True,
+            )
+            I_series = np.asarray(outputs[:, 1], dtype=np.float32)
+        except Exception as exc:
+            logger.warning("Simulation failed for idx=%d: %s", idx, exc)
+            I_series = np.full(t_len, np.nan, dtype=np.float32)
+
+        if I_series.shape[0] != t_len:
+            padded = np.full(t_len, np.nan, dtype=np.float32)
+            max_len = min(I_series.shape[0], t_len)
+            padded[:max_len] = I_series[:max_len]
+            I_series = padded
+
+        X[idx] = I_series
+
+        if progress_every and (idx + 1) % progress_every == 0:
+            logger.info("Simulated %d/%d curves", idx + 1, n)
+
+    return X
+
+
+def _build_feature_matrix(
+    s0: np.ndarray,
+    i0: np.ndarray,
+    pop: np.ndarray,
+    feature_scale: str,
+    pop_range: Tuple[float, float],
+) -> tuple[np.ndarray, list[str]]:
+    pop_safe = np.where(pop > 0, pop, 1.0)
+    if feature_scale == "absolute":
+        features = np.column_stack([s0, i0, pop_safe]).astype(np.float32)
+        names = ["s0", "i0", "n"]
+        return features, names
+
+    pop_max = pop_range[1]
+    if pop_max <= 0:
+        pop_max = float(np.max(pop_safe)) if pop_safe.size else 1.0
+    pop_scaled = pop_safe / (pop_max if pop_max > 0 else 1.0)
+    features = np.column_stack([s0 / pop_safe, i0 / pop_safe, pop_scaled]).astype(np.float32)
+    names = ["s0_frac", "i0_frac", "n_scaled"]
+    return features, names
+
+
+def main() -> None:
+    args = _parse_args()
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = Path(args.out_dir) if args.out_dir else DEFAULTS.runs_dir / f"exp4_{timestamp}"
+    ensure_dir(out_dir)
+    models_dir = out_dir / "models"
+
+    log_file = None
+    if not args.no_log_file:
+        log_file = Path(args.log_file) if args.log_file else out_dir / "run.log"
+    setup_logging(level=args.log_level, log_file=log_file, console=not args.no_console_log)
+    logger = logging.getLogger(__name__)
+
+    auto_selected = _apply_auto_select(args, logger)
+    if not auto_selected:
+        _apply_run_all(args)
+
+    logger.info("Exp4 start")
+    logger.info("Output dir: %s", out_dir)
+
+    set_global_seed(args.seed)
+    rng = np.random.default_rng(args.seed)
+
+    logger.info(
+        "Config: noise=%s train-mode=%s rho=%s k=%s limit=%s max-test=%s n-starts=%s seed=%s normalize=%s feature-mode=%s",
+        args.noise,
+        args.train_mode,
+        args.rho,
+        args.k,
+        args.limit,
+        args.max_test,
+        args.n_starts,
+        args.seed,
+        args.normalize,
+        args.feature_mode,
+    )
+
+    cache_config = {
+        "exp": "exp4",
+        "data_path": str(args.data_path),
+        "limit": args.limit,
+        "seed": args.seed,
+        "test_size": args.test_size,
+        "val_size": args.val_size,
+        "population_range": list(args.population_range),
+        "i0_range": list(args.i0_range),
+        "r0_range": list(args.r0_range),
+        "init_fraction": bool(args.init_fraction),
+    }
+    cache_key = hash_config(cache_config)
+    logger.info("Cache key: %s", cache_key)
+
+    if not args.no_cache and cache_exists(args.cache_dir, cache_key):
+        logger.info("Loading cached arrays from %s", args.cache_dir)
+        arrays, _ = load_cache(args.cache_dir, cache_key)
+        X = arrays["X"]
+        y = arrays["y"]
+        pop = arrays["pop"]
+        s0 = arrays["s0"]
+        i0 = arrays["i0"]
+        r0 = arrays["r0"]
+        times = arrays["times"]
+        splits = {
+            "X_train": X[arrays["idx_train"]],
+            "y_train": y[arrays["idx_train"]],
+            "X_val": X[arrays["idx_val"]],
+            "y_val": y[arrays["idx_val"]],
+            "X_test": X[arrays["idx_test"]],
+            "y_test": y[arrays["idx_test"]],
+            "idx_train": arrays["idx_train"],
+            "idx_val": arrays["idx_val"],
+            "idx_test": arrays["idx_test"],
+        }
+    else:
+        logger.info("Loading sir.pkl from %s (limit=%s)", args.data_path, args.limit)
+        data = load_sir_pkl(args.data_path, limit=args.limit, rng=rng)
+        params = np.asarray([entry[2] for entry in data], dtype=np.float32)
+        t0, t1, dt, times = _resolve_time_grid(data)
+        s0, i0, r0, pop = _sample_initial_conditions(
+            params.shape[0],
+            tuple(args.population_range),
+            tuple(args.i0_range),
+            tuple(args.r0_range),
+            args.init_fraction,
+            rng,
+        )
+        logger.info("Simulating variable-init curves (n=%d)", params.shape[0])
+        X = _simulate_curves(
+            params,
+            s0,
+            i0,
+            r0,
+            t0=t0,
+            t1=t1,
+            dt=dt,
+            times=times,
+            logger=logger,
+            progress_every=args.progress_every,
+        )
+        y = params[:, :2]
+
+        splits = train_val_test_split(
+            X, y, test_size=args.test_size, val_size=args.val_size, rng=rng, return_indices=True
+        )
+        if not args.no_cache:
+            logger.info("Saving cache to %s", args.cache_dir)
+            save_cache(
+                args.cache_dir,
+                cache_key,
+                {
+                    "X": X,
+                    "y": y,
+                    "pop": pop,
+                    "s0": s0,
+                    "i0": i0,
+                    "r0": r0,
+                    "times": np.asarray(times),
+                    "idx_train": splits["idx_train"],
+                    "idx_val": splits["idx_val"],
+                    "idx_test": splits["idx_test"],
+                },
+                cache_config,
+            )
+
+    times = np.asarray(times, dtype=float)
+
+    X_train = splits["X_train"]
+    y_train = splits["y_train"]
+    X_val = splits["X_val"]
+    y_val = splits["y_val"]
+    X_test = splits["X_test"]
+    y_test = splits["y_test"]
+    s0_train = s0[splits["idx_train"]]
+    i0_train = i0[splits["idx_train"]]
+    r0_train = r0[splits["idx_train"]]
+    s0_val = s0[splits["idx_val"]]
+    i0_val = i0[splits["idx_val"]]
+    r0_val = r0[splits["idx_val"]]
+    s0_test = s0[splits["idx_test"]]
+    i0_test = i0[splits["idx_test"]]
+    r0_test = r0[splits["idx_test"]]
+    pop_train = pop[splits["idx_train"]]
+    pop_val = pop[splits["idx_val"]]
+    pop_test = pop[splits["idx_test"]]
+
+    logger.info(
+        "Dataset shapes: train=%s val=%s test=%s (T=%s)",
+        X_train.shape,
+        X_val.shape,
+        X_test.shape,
+        X_train.shape[1],
+    )
+
+    if args.train_mode == "clean":
+        X_train_obs = X_train
+        X_val_obs = X_val
+    elif args.train_mode == "noisy":
+        X_train_obs = _apply_noise_batch(X_train, args.noise, args.rho, args.k, rng)
+        X_val_obs = _apply_noise_batch(X_val, args.noise, args.rho, args.k, rng)
+    else:
+        X_train_obs = _apply_mixed_noise(
+            X_train,
+            tuple(args.rho_range),
+            tuple(args.k_range),
+            args.p_poisson,
+            rng,
+        )
+        X_val_obs = _apply_mixed_noise(
+            X_val,
+            tuple(args.rho_range),
+            tuple(args.k_range),
+            args.p_poisson,
+            rng,
+        )
+
+    X_test_obs = _apply_noise_batch(X_test, args.noise, args.rho, args.k, rng)
+    logger.info("Applied observation noise to test set (noise=%s)", args.noise)
+
+    results = []
+    scenario = "varinit_frac" if args.init_fraction else "varinit_abs"
+    if args.feature_mode != "none":
+        scenario = f"{scenario}_{args.feature_mode}_{args.feature_scale}"
+    scenario = f"{scenario}_train_{args.train_mode}_test_{args.noise}"
+
+    baseline_pred_by_method: dict[str, dict[int, np.ndarray]] = {}
+    baseline_y_pred: dict[str, np.ndarray] = {}
+    model_artifacts: list[dict[str, object]] = []
+    idx_fit = np.array([], dtype=int)
+    y_test_fit = y_test[:0]
+
+    baseline_methods = _resolve_baseline_methods(args.baseline_methods, args.noise) if args.run_baseline else []
+
+    if args.run_baseline and baseline_methods:
+        X_test_fit, idx_fit = _subset(X_test_obs, args.max_test, rng)
+        y_test_fit = y_test[idx_fit]
+        logger.info(
+            "Baseline fitting on %d curves (methods=%s)",
+            X_test_fit.shape[0],
+            baseline_methods,
+        )
+
+        baseline_registry = {
+            "mle_poisson": (
+                "baseline_mle_poisson",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_poisson_mle(
+                    obs,
+                    rho=args.rho,
+                    estimate_rho=args.estimate_rho,
+                    n_starts=args.n_starts,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "mle_negbin": (
+                "baseline_mle_negbin",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_negbin_mle(
+                    obs,
+                    rho=args.rho,
+                    k=args.k,
+                    estimate_rho=args.estimate_rho,
+                    n_starts=args.n_starts,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "mle_poisson_de": (
+                "baseline_mle_poisson_de",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_poisson_mle_de(
+                    obs,
+                    rho=args.rho,
+                    estimate_rho=args.estimate_rho,
+                    maxiter=args.de_maxiter,
+                    popsize=args.de_popsize,
+                    polish=args.de_polish,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "mle_negbin_de": (
+                "baseline_mle_negbin_de",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_negbin_mle_de(
+                    obs,
+                    rho=args.rho,
+                    k=args.k,
+                    estimate_rho=args.estimate_rho,
+                    maxiter=args.de_maxiter,
+                    popsize=args.de_popsize,
+                    polish=args.de_polish,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "mse": (
+                "baseline_mse",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_mse(
+                    obs,
+                    n_starts=args.n_starts,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "wls": (
+                "baseline_wls",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_wls(
+                    obs,
+                    n_starts=args.n_starts,
+                    wls_eps=args.wls_eps,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "log_mse": (
+                "baseline_log_mse",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_log_mse(
+                    obs,
+                    n_starts=args.n_starts,
+                    log_eps=args.log_eps,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "huber": (
+                "baseline_huber",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_huber(
+                    obs,
+                    n_starts=args.n_starts,
+                    delta=args.huber_delta,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+            "mse_de": (
+                "baseline_mse_de",
+                lambda obs, r, s0_i, i0_i, r0_i: fit_mse_de(
+                    obs,
+                    maxiter=args.de_maxiter,
+                    popsize=args.de_popsize,
+                    polish=args.de_polish,
+                    rng=r,
+                    t0=t0,
+                    t1=t1,
+                    dt=dt,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
+                ),
+            ),
+        }
+
+        t0 = float(times[0])
+        dt = float(np.median(np.diff(times))) if times.size > 1 else float(DEFAULTS.dt)
+        t1 = t0 + dt * (times.shape[0] - 1)
+
+        for method_key in baseline_methods:
+            label, fitter = baseline_registry[method_key]
+            y_pred_list = []
+            fit_times = []
+            start = time.perf_counter()
+            for i in range(X_test_fit.shape[0]):
+                curve_idx = int(idx_fit[i])
+                local_rng = np.random.default_rng(args.seed + i)
+                fit = fitter(
+                    X_test_fit[i],
+                    local_rng,
+                    float(s0_test[curve_idx]),
+                    float(i0_test[curve_idx]),
+                    float(r0_test[curve_idx]),
+                )
+                y_pred_list.append(fit.params[:2])
+                fit_times.append(sum(fit.times))
+                if (i + 1) % args.progress_every == 0 or (i + 1) == X_test_fit.shape[0]:
+                    elapsed = time.perf_counter() - start
+                    avg = elapsed / (i + 1)
+                    logger.info(
+                        "Baseline %s progress: %d/%d curves (avg %.3fs/curve)",
+                        label,
+                        i + 1,
+                        X_test_fit.shape[0],
+                        avg,
+                    )
+
+            y_pred = np.asarray(y_pred_list)
+            baseline_pred_by_method[label] = {int(idx_fit[i]): y_pred[i] for i in range(idx_fit.shape[0])}
+            baseline_y_pred[label] = y_pred
+            metrics = per_param_metrics(y_test_fit, y_pred)
+            metrics.update(timing_summary(np.asarray(fit_times)))
+            metrics.update({
+                "method": label,
+                "scenario": scenario,
+                "n_test": int(X_test_fit.shape[0]),
+            })
+            results.append(metrics)
+    else:
+        logger.info("Skipping baseline fit (no --run-baseline flag)")
+
+    y_pred_ml: dict[str, np.ndarray] = {}
+    ml_flags = [
+        args.run_linear,
+        args.run_mlp,
+        args.run_mlp_branched,
+        args.run_resmlp,
+        args.run_cnn1d,
+        args.run_tcn,
+        args.run_inception,
+        args.run_attn_cnn,
+        args.run_gru,
+        args.run_lstm,
+        args.run_conv_gru,
+        args.run_transformer,
+        args.run_mlp_hetero,
+        args.run_mlp_mdn,
+    ]
+
+    feature_names: list[str] = []
+    if any(ml_flags):
+        logger.info("Preparing normalized inputs for ML (method=%s)", args.normalize)
+        X_train_in = normalize_series(X_train_obs, method=args.normalize, population=pop_train)
+        X_val_in = normalize_series(X_val_obs, method=args.normalize, population=pop_val)
+        X_test_in = normalize_series(X_test_obs, method=args.normalize, population=pop_test)
+
+        if args.feature_mode != "none":
+            feat_train, feature_names = _build_feature_matrix(
+                s0_train, i0_train, pop_train, args.feature_scale, tuple(args.population_range)
+            )
+            feat_val, _ = _build_feature_matrix(
+                s0_val, i0_val, pop_val, args.feature_scale, tuple(args.population_range)
+            )
+            feat_test, _ = _build_feature_matrix(
+                s0_test, i0_test, pop_test, args.feature_scale, tuple(args.population_range)
+            )
+            X_train_in = np.concatenate([X_train_in, feat_train], axis=1)
+            X_val_in = np.concatenate([X_val_in, feat_val], axis=1)
+            X_test_in = np.concatenate([X_test_in, feat_test], axis=1)
+            logger.info("Appended static features (%s) to ML inputs", feature_names)
+
+        input_dim = X_train_in.shape[1]
+        model_specs = [
+            ("linear", args.run_linear, lambda: ml.build_linear(input_dim=input_dim)),
+            ("mlp", args.run_mlp, lambda: ml.build_mlp(input_dim=input_dim)),
+            ("mlp_branched", args.run_mlp_branched, lambda: ml.build_mlp_branched(input_dim=input_dim)),
+            ("resmlp", args.run_resmlp, lambda: ml.build_resmlp(input_dim=input_dim)),
+            ("cnn1d", args.run_cnn1d, lambda: ml.build_cnn1d(input_len=input_dim)),
+            ("tcn", args.run_tcn, lambda: ml.build_tcn(input_len=input_dim)),
+            ("inception", args.run_inception, lambda: ml.build_inception(input_len=input_dim)),
+            ("attn_cnn", args.run_attn_cnn, lambda: ml.build_attn_cnn(input_len=input_dim)),
+            ("gru", args.run_gru, lambda: ml.build_gru(input_len=input_dim)),
+            ("lstm", args.run_lstm, lambda: ml.build_lstm(input_len=input_dim)),
+            ("conv_gru", args.run_conv_gru, lambda: ml.build_conv_gru(input_len=input_dim)),
+            ("transformer", args.run_transformer, lambda: ml.build_transformer(input_len=input_dim)),
+            ("mlp_hetero", args.run_mlp_hetero, lambda: ml.build_mlp_heteroscedastic(input_dim=input_dim)),
+            ("mlp_mdn", args.run_mlp_mdn, lambda: ml.build_mlp_mdn(input_dim=input_dim)),
+        ]
+
+        for name, enabled, builder in model_specs:
+            if not enabled:
+                continue
+            logger.info("Training %s", name)
+            model = builder()
+            train_res = ml.train_model(
+                model,
+                X_train_in,
+                y_train,
+                X_val_in,
+                y_val,
+                epochs=args.epochs,
+                patience=args.patience,
+                batch_size=args.batch_size,
+            )
+            logger.info("%s training done (train_time_sec=%.2f)", name, train_res.train_time_sec)
+            y_pred = ml.predict_params(model, X_test_in)
+            y_pred_ml[name] = y_pred
+            metrics = per_param_metrics(y_test, y_pred)
+            metrics.update(timing_summary(ml.predict_time_per_sample(model, X_test_in)))
+            metrics.update({
+                "method": name,
+                "scenario": scenario,
+                "n_test": int(X_test.shape[0]),
+                "train_time_sec": float(train_res.train_time_sec),
+            })
+            results.append(metrics)
+            artifact = ml.save_model_artifacts(model, name, models_dir)
+            model_artifacts.append(_relativize_paths(artifact, out_dir))
+            ml.release_model(model)
+            logger.info("Released model resources for %s", name)
+    else:
+        logger.info("Skipping ML models (no --run-* flags)")
+
+    baseline_methods = sorted(baseline_y_pred.keys())
+    ensure_dir(models_dir)
+    save_json(
+        models_dir / "manifest.json",
+        {
+            "exp": "exp4",
+            "baseline_methods": baseline_methods,
+            "ml_architectures": sorted(y_pred_ml.keys()),
+            "feature_names": feature_names,
+            "models": model_artifacts,
+        },
+    )
+
+    config = vars(args)
+    config.update({
+        "timestamp": timestamp,
+        "baseline_methods": baseline_methods,
+        "ml_architectures": sorted(y_pred_ml.keys()),
+        "feature_names": feature_names,
+    })
+    save_json(out_dir / "config.json", config)
+    save_csv(out_dir / "metrics.csv", results)
+    logger.info("Saved metrics to %s", out_dir / "metrics.csv")
+
+    if args.save_predictions:
+        pred_dir = Path(args.pred_dir) if args.pred_dir else out_dir
+        ensure_dir(pred_dir)
+        times_arr = np.asarray(times, dtype=float)
+        y_pred_by_method = {}
+
+        if args.run_baseline and baseline_y_pred:
+            for label, y_pred_fit in baseline_y_pred.items():
+                baseline_full = np.full_like(y_test, np.nan, dtype=float)
+                if idx_fit.size > 0:
+                    baseline_full[idx_fit] = y_pred_fit
+                y_pred_by_method[label] = baseline_full
+        y_pred_by_method.update(y_pred_ml)
+
+        init_states = np.column_stack([s0_test, i0_test, r0_test])
+        predicted_sir_paths = save_predicted_sir(
+            pred_dir,
+            times=times_arr,
+            y_pred_by_method=y_pred_by_method,
+            s0=float(DEFAULTS.s0),
+            i0=float(DEFAULTS.i0),
+            r0=float(DEFAULTS.r0),
+            t0=float(times_arr[0]) if times_arr.size else DEFAULTS.t0,
+            dt=float(np.median(np.diff(times_arr))) if times_arr.size > 1 else DEFAULTS.dt,
+            y_true=y_test,
+            init_states=init_states,
+        )
+        predicted_sir_files = {}
+        for method, path in predicted_sir_paths.items():
+            try:
+                predicted_sir_files[method] = str(path.relative_to(pred_dir))
+            except ValueError:
+                predicted_sir_files[method] = str(path)
+
+        save_predictions(
+            pred_dir,
+            times=times_arr,
+            i_true=X_test,
+            i_obs=X_test_obs,
+            y_true=y_test,
+            y_pred_by_method=y_pred_by_method,
+            idx_test=splits["idx_test"],
+            idx_fit=idx_fit if args.run_baseline else None,
+            extra_arrays={
+                "s0": s0_test,
+                "i0": i0_test,
+                "r0": r0_test,
+                "pop": pop_test,
+            },
+            metadata={
+                "exp": "exp4",
+                "scenario": scenario,
+                "noise": args.noise,
+                "train_mode": args.train_mode,
+                "baseline_method": baseline_methods[0] if baseline_methods else None,
+                "baseline_methods": baseline_methods,
+                "ml_architectures": sorted(y_pred_ml.keys()),
+                "run_all": bool(args.run_all),
+                "run_baseline": bool(args.run_baseline),
+                "auto_select": bool(args.auto_select),
+                "exp1_final_log": args.exp1_final_log,
+                "top_baselines": int(args.top_baselines),
+                "top_ml": int(args.top_ml),
+                "normalize": args.normalize,
+                "n_starts": int(args.n_starts),
+                "wls_eps": float(args.wls_eps),
+                "log_eps": float(args.log_eps),
+                "huber_delta": float(args.huber_delta),
+                "de_maxiter": int(args.de_maxiter),
+                "de_popsize": int(args.de_popsize),
+                "de_polish": bool(args.de_polish),
+                "max_test": args.max_test,
+                "test_size": float(args.test_size),
+                "val_size": float(args.val_size),
+                "limit": args.limit,
+                "rho": float(args.rho),
+                "k": float(args.k),
+                "estimate_rho": bool(args.estimate_rho),
+                "rho_range": list(args.rho_range),
+                "k_range": list(args.k_range),
+                "p_poisson": float(args.p_poisson),
+                "seed": args.seed,
+                "feature_mode": args.feature_mode,
+                "feature_scale": args.feature_scale,
+                "feature_names": feature_names,
+                "population_range": list(args.population_range),
+                "i0_range": list(args.i0_range),
+                "r0_range": list(args.r0_range),
+                "init_fraction": bool(args.init_fraction),
+                "t0": float(times_arr[0]) if times_arr.size else DEFAULTS.t0,
+                "dt": float(np.median(np.diff(times_arr))) if times_arr.size > 1 else DEFAULTS.dt,
+                "predicted_sir_files": predicted_sir_files,
+            },
+        )
+        logger.info("Saved predictions to %s", pred_dir)
+
+    if args.save_plots or args.save_plot_data:
+        from src.visualization import visualize as viz
+
+        plot_dir = Path(args.plot_dir) if args.plot_dir else out_dir / "figures"
+        ensure_dir(plot_dir)
+        logger.info("Saving plots/plot-data to %s", plot_dir)
+
+        plot_rng = np.random.default_rng(args.seed + 12345)
+        plot_pool = idx_fit if idx_fit.size > 0 else np.arange(X_test.shape[0])
+        plot_idx = _choose_plot_indices(plot_pool, args.n_plot, plot_rng)
+
+        t0 = float(times[0]) if times.size else DEFAULTS.t0
+        dt = float(np.median(np.diff(times))) if times.size > 1 else DEFAULTS.dt
+        t1_eff = t0 + dt * (X_test.shape[1] - 1)
+
+        curves_list = []
+        error_list = []
+        for idx in plot_idx:
+            curves = {
+                "I_true": X_test[idx],
+                "Y_obs": X_test_obs[idx],
+            }
+            errors = {}
+            for label, pred_map in baseline_pred_by_method.items():
+                if idx in pred_map:
+                    params = pred_map[int(idx)]
+                    I_pred = simulate_sir(
+                        params[0],
+                        params[1],
+                        s0=float(s0_test[idx]),
+                        i0=float(i0_test[idx]),
+                        r0=float(r0_test[idx]),
+                        t0=t0,
+                        t1=t1_eff,
+                        dt=dt,
+                    )
+                    curves[f"I_pred_{label}"] = I_pred
+                    errors[label] = np.abs(I_pred - X_test[idx])
+
+            for method_name, y_pred_full in y_pred_ml.items():
+                params = y_pred_full[idx]
+                I_pred = simulate_sir(
+                    params[0],
+                    params[1],
+                    s0=float(s0_test[idx]),
+                    i0=float(i0_test[idx]),
+                    r0=float(r0_test[idx]),
+                    t0=t0,
+                    t1=t1_eff,
+                    dt=dt,
+                )
+                curves[f"I_pred_{method_name}"] = I_pred
+                errors[method_name] = np.abs(I_pred - X_test[idx])
+
+            curves_list.append(curves)
+            error_list.append(errors)
+
+        use_fit_subset = args.run_baseline and idx_fit.size > 0
+        if use_fit_subset:
+            y_true_plot = y_test_fit
+            y_pred_by_method = {}
+            for label, y_pred_fit in baseline_y_pred.items():
+                y_pred_by_method[label] = y_pred_fit
+            for method_name, y_pred_full in y_pred_ml.items():
+                y_pred_by_method[method_name] = y_pred_full[idx_fit]
+        else:
+            y_true_plot = y_test
+            y_pred_by_method = dict(y_pred_ml)
+            for label, y_pred_fit in baseline_y_pred.items():
+                baseline_full = np.full_like(y_test, np.nan, dtype=float)
+                if idx_fit.size > 0:
+                    baseline_full[idx_fit] = y_pred_fit
+                y_pred_by_method[label] = baseline_full
+
+        if args.save_plots:
+            viz.save_experiment_figures(
+                plot_dir,
+                times,
+                curves_list,
+                error_list,
+                y_true_plot,
+                y_pred_by_method,
+                results,
+                title_prefix="Exp4",
+                max_ml_methods=args.plot_max_ml,
+                max_baseline_methods=args.plot_max_baseline,
+                legend=args.plot_legend,
+            )
+
+        if args.save_plot_data:
+            viz.save_plot_data(
+                plot_dir,
+                times,
+                plot_idx,
+                curves_list,
+                error_list,
+                y_true_plot,
+                y_pred_by_method,
+                idx_fit=idx_fit if args.run_baseline else None,
+                metadata={
+                    "exp": "exp4",
+                    "scenario": scenario,
+                    "noise": args.noise,
+                    "train_mode": args.train_mode,
+                    "baseline_method": baseline_methods[0] if baseline_methods else None,
+                    "baseline_methods": baseline_methods,
+                    "ml_architectures": sorted(y_pred_ml.keys()),
+                    "run_all": bool(args.run_all),
+                    "run_baseline": bool(args.run_baseline),
+                    "auto_select": bool(args.auto_select),
+                    "exp1_final_log": args.exp1_final_log,
+                    "top_baselines": int(args.top_baselines),
+                    "top_ml": int(args.top_ml),
+                    "normalize": args.normalize,
+                    "n_starts": int(args.n_starts),
+                    "wls_eps": float(args.wls_eps),
+                    "log_eps": float(args.log_eps),
+                    "huber_delta": float(args.huber_delta),
+                    "de_maxiter": int(args.de_maxiter),
+                    "de_popsize": int(args.de_popsize),
+                    "de_polish": bool(args.de_polish),
+                    "max_test": args.max_test,
+                    "test_size": float(args.test_size),
+                    "val_size": float(args.val_size),
+                    "limit": args.limit,
+                    "rho": float(args.rho),
+                    "k": float(args.k),
+                    "estimate_rho": bool(args.estimate_rho),
+                    "rho_range": list(args.rho_range),
+                    "k_range": list(args.k_range),
+                    "p_poisson": float(args.p_poisson),
+                    "seed": args.seed,
+                    "n_plot": int(args.n_plot),
+                    "plot_max_ml": int(args.plot_max_ml),
+                    "plot_max_baseline": int(args.plot_max_baseline),
+                    "plot_legend": args.plot_legend,
+                    "feature_mode": args.feature_mode,
+                    "feature_scale": args.feature_scale,
+                    "feature_names": feature_names,
+                    "population_range": list(args.population_range),
+                    "i0_range": list(args.i0_range),
+                    "r0_range": list(args.r0_range),
+                    "init_fraction": bool(args.init_fraction),
+                },
+            )
+
+    artifacts = ["config.json", "metrics.csv", "run.log", "models/"]
+    if args.save_predictions:
+        artifacts.append("predictions.npz/json")
+        artifacts.append("predicted_sir/")
+    if args.save_plots or args.save_plot_data:
+        artifacts.append("figures/")
+
+    args_summary = summarize_args(
+        vars(args),
+        keys=[
+            "limit",
+            "max_test",
+            "n_starts",
+            "seed",
+            "normalize",
+            "noise",
+            "train_mode",
+            "rho",
+            "k",
+            "estimate_rho",
+            "rho_range",
+            "k_range",
+            "p_poisson",
+            "population_range",
+            "i0_range",
+            "r0_range",
+            "init_fraction",
+            "feature_mode",
+            "feature_scale",
+            "run_all",
+            "run_baseline",
+            "baseline_methods",
+            "auto_select",
+            "exp1_final_log",
+            "top_baselines",
+            "top_ml",
+            "wls_eps",
+            "log_eps",
+            "huber_delta",
+            "de_maxiter",
+            "de_popsize",
+            "de_polish",
+            "run_mlp",
+            "run_mlp_branched",
+            "run_cnn1d",
+            "run_linear",
+            "run_resmlp",
+            "run_tcn",
+            "run_inception",
+            "run_attn_cnn",
+            "run_gru",
+            "run_lstm",
+            "run_conv_gru",
+            "run_transformer",
+            "run_mlp_hetero",
+            "run_mlp_mdn",
+            "epochs",
+            "patience",
+            "batch_size",
+            "save_plots",
+            "save_plot_data",
+            "plot_max_ml",
+            "plot_max_baseline",
+            "plot_legend",
+            "save_predictions",
+        ],
+    )
+    title = f"{timestamp} — Exp4 (variable init, noise={args.noise}, train={args.train_mode})"
+    update_experiment_log(
+        args.exp_log,
+        exp_key="exp4",
+        title=title,
+        run_dir=out_dir,
+        script="scripts/exp4_varinit.py",
+        args_summary=args_summary,
+        artifacts=artifacts,
+        metrics_rows=results,
+        mark_final=args.mark_final,
+        final_note=args.final_note,
+    )
+
+
+if __name__ == "__main__":
+    main()

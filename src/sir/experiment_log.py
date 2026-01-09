@@ -16,6 +16,8 @@ EXPERIMENT_TITLES = {
     "exp0": "Exp0 (clean)",
     "exp1": "Exp1 (noise)",
     "exp2": "Exp2 (window/downsample)",
+    "exp3": "Exp3 (rho sweep)",
+    "exp4": "Exp4 (variable init)",
 }
 
 
@@ -61,6 +63,8 @@ TEMPLATE = "\n".join([
     _section_template("exp0", EXPERIMENT_TITLES["exp0"]),
     _section_template("exp1", EXPERIMENT_TITLES["exp1"]),
     _section_template("exp2", EXPERIMENT_TITLES["exp2"]),
+    _section_template("exp3", EXPERIMENT_TITLES["exp3"]),
+    _section_template("exp4", EXPERIMENT_TITLES["exp4"]),
 ]).strip() + "\n"
 
 

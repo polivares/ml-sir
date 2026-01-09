@@ -30,6 +30,7 @@ def save_predictions(
     i_obs: Optional[np.ndarray] = None,
     prefix: str = "",
     metadata: Optional[Dict[str, object]] = None,
+    extra_arrays: Optional[Mapping[str, np.ndarray]] = None,
 ) -> Tuple[Path, Path]:
     """Save predictions + inputs for a run as NPZ + JSON metadata."""
     out_dir = Path(out_dir)
@@ -49,6 +50,10 @@ def save_predictions(
 
     for label, y_pred in y_pred_by_method.items():
         arrays[f"y_pred_{label}"] = np.asarray(y_pred, dtype=float)
+
+    if extra_arrays:
+        for key, value in extra_arrays.items():
+            arrays[str(key)] = np.asarray(value)
 
     npz_path = out_dir / f"{prefix}predictions.npz"
     np.savez_compressed(npz_path, **arrays)
@@ -76,39 +81,54 @@ def save_predicted_sir(
     dt: float,
     y_true: Optional[np.ndarray] = None,
     prefix: str = "",
+    init_states: Optional[np.ndarray] = None,
 ) -> Dict[str, Path]:
     """Save SIR trajectories simulated from predicted parameters.
 
     Each output file is a list of tuples `(outputs, times, params)` that mimics
     the `sir.pkl` structure (outputs shape: T x 3 with [S, I, R]).
     If y_true is provided, an additional `predicted_sir_ground_truth.pkl` file
-    is written using the true parameters.
+    is written using the true parameters. If init_states is provided, each
+    curve is simulated with its corresponding (S0, I0, R0).
     """
     out_dir = Path(out_dir) / "predicted_sir"
     ensure_dir(out_dir)
 
     times = np.asarray(times, dtype=float)
     t1 = t0 + dt * (times.shape[0] - 1)
+    init_states_arr: Optional[np.ndarray] = None
+    if init_states is not None:
+        init_states_arr = np.asarray(init_states, dtype=float)
+        if init_states_arr.ndim != 2 or init_states_arr.shape[1] < 3:
+            raise ValueError("init_states must have shape (n_samples, >=3)")
 
     def _empty_outputs() -> np.ndarray:
         return np.full((times.shape[0], 3), np.nan, dtype=float)
 
     def _build_records(params_array: np.ndarray) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
         records = []
-        for params in params_array:
+        for idx, params in enumerate(params_array):
             params = np.asarray(params, dtype=float)
             params_out = params[:2] if params.shape[0] >= 2 else np.array([np.nan, np.nan])
             if params.shape[0] < 2 or not np.all(np.isfinite(params[:2])):
                 outputs = _empty_outputs()
                 records.append((outputs, times, params_out))
                 continue
+            if init_states_arr is not None:
+                if idx >= init_states_arr.shape[0]:
+                    outputs = _empty_outputs()
+                    records.append((outputs, times, params_out))
+                    continue
+                s0_i, i0_i, r0_i = init_states_arr[idx][:3]
+            else:
+                s0_i, i0_i, r0_i = s0, i0, r0
             try:
                 sim_times, outputs = simulate_sir(
                     params_out[0],
                     params_out[1],
-                    s0=s0,
-                    i0=i0,
-                    r0=r0,
+                    s0=s0_i,
+                    i0=i0_i,
+                    r0=r0_i,
                     t0=t0,
                     t1=t1,
                     dt=dt,
