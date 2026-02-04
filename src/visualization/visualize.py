@@ -34,7 +34,12 @@ from src.sir.io import ensure_dir
 from src.sir.metrics import per_param_metrics
 
 
-def save_figure(fig: plt.Figure, path: Path | str, dpi: int = 150) -> Path:
+def save_figure(
+    fig: plt.Figure,
+    path: Path | str,
+    dpi: int = 150,
+    formats: Optional[Sequence[str]] = None,
+) -> Path:
     """Save a Matplotlib figure and ensure the parent directory exists."""
     path = Path(path)
     ensure_dir(path.parent)
@@ -46,7 +51,13 @@ def save_figure(fig: plt.Figure, path: Path | str, dpi: int = 150) -> Path:
         fig.tight_layout(rect=(0.0, bottom, 1.0, top))
     else:
         fig.tight_layout()
-    fig.savefig(path, dpi=dpi, bbox_inches="tight")
+    if formats is None:
+        fig.savefig(path, dpi=dpi, bbox_inches="tight")
+        return path
+    formats = [str(fmt).lstrip(".") for fmt in formats]
+    for fmt in formats:
+        out_path = path.with_suffix(f".{fmt}")
+        fig.savefig(out_path, dpi=dpi, bbox_inches="tight")
     return path
 
 

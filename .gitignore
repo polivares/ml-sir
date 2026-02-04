@@ -88,7 +88,7 @@ target/
 # Mypy cache
 .mypy_cache/
 
-# Local AI agent instructions (do not commit)
+# Local agent instructions (do not commit)
 AGENTS.md
 
 # Local human runbook (do not commit)
@@ -102,3 +102,23 @@ EXPERIMENTS.md
 runs/*
 !runs/README.md
 data/processed/
+
+reports/
+
+# Keep the GitHub repo code-only by default
+data/
+notebooks/
+references/
+models/
+
+# Common large/binary artifacts
+*.h5
+*.npz
+*.npy
+*.xlsx
+*.pdf
+
+# Paper-specific helpers (kept local)
+scripts/paper_generate_figures.py
+scripts/paper_generate_tables.py
+src/visualization/paper_figures.py
